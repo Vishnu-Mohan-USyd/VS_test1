@@ -40,6 +40,34 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+try:
+    from scipy.ndimage import gaussian_filter  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    gaussian_filter = None
+
+
+def _gaussian_filter_fallback(img: np.ndarray, sigma: float) -> np.ndarray:
+    """Small, dependency-free Gaussian blur fallback (separable, reflect padding).
+
+    Only used for visualization when SciPy isn't available.
+    """
+    sigma = float(sigma)
+    if sigma <= 0.0:
+        return img
+    radius = int(max(1, math.ceil(3.0 * sigma)))
+    x = np.arange(-radius, radius + 1, dtype=np.float64)
+    k = np.exp(-(x * x) / (2.0 * sigma * sigma))
+    k /= float(k.sum() + 1e-12)
+
+    arr = img.astype(np.float64, copy=False)
+
+    pad = radius
+    a = np.pad(arr, ((0, 0), (pad, pad)), mode="reflect")
+    a = np.apply_along_axis(lambda v: np.convolve(v, k, mode="valid"), 1, a)
+
+    a = np.pad(a, ((pad, pad), (0, 0)), mode="reflect")
+    a = np.apply_along_axis(lambda v: np.convolve(v, k, mode="valid"), 0, a)
+    return a.astype(np.float32, copy=False)
 
 
 def safe_mkdir(path: str) -> None:
@@ -61,6 +89,28 @@ def max_circ_gap_180(angles_deg: np.ndarray) -> float:
     gaps = np.diff(np.concatenate([a, a[:1] + 180.0]))
     return float(gaps.max())
 
+def _projection_kernel(N: int, X_src: np.ndarray, Y_src: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian "scatter" kernel from irregular source samples -> regular N×N grid.
+
+    Returns K with shape (N*N, N*N) such that:
+        field_grid_flat = weights @ K.T
+
+    where `weights` has shape (M, N*N) corresponding to source samples at (X_src, Y_src).
+    """
+    sigma = float(sigma)
+    if sigma <= 0.0:
+        raise ValueError("sigma must be > 0 for projection kernel")
+
+    xs = (np.arange(int(N), dtype=np.float64) - (int(N) - 1) / 2.0).astype(np.float64)
+    ys = (np.arange(int(N), dtype=np.float64) - (int(N) - 1) / 2.0).astype(np.float64)
+    Xg, Yg = np.meshgrid(xs, ys, indexing="xy")
+    grid = np.stack([Xg.ravel(), Yg.ravel()], axis=1)  # (G,2)
+
+    src = np.stack([X_src.astype(np.float64).ravel(), Y_src.astype(np.float64).ravel()], axis=1)  # (P,2)
+    d2 = np.square(grid[:, None, :] - src[None, :, :]).sum(axis=2)  # (G,P)
+    K = np.exp(-d2 / (2.0 * sigma * sigma)).astype(np.float32, copy=False)
+    return K
+
 
 def compute_osi(rates_hz: np.ndarray, thetas_deg: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Classic doubled-angle OSI.
@@ -74,6 +124,173 @@ def compute_osi(rates_hz: np.ndarray, thetas_deg: np.ndarray) -> Tuple[np.ndarra
     osi = np.abs(vec) / denom
     pref = (0.5 * np.angle(vec)) % np.pi
     return osi, np.rad2deg(pref)
+
+def onoff_weight_corr(
+    W: np.ndarray,
+    N: int,
+    *,
+    on_to_off: np.ndarray | None = None,
+    X_on: np.ndarray | None = None,
+    Y_on: np.ndarray | None = None,
+    X_off: np.ndarray | None = None,
+    Y_off: np.ndarray | None = None,
+    sigma: float | None = None,
+) -> np.ndarray:
+    """Per-neuron correlation between ON and OFF thalamocortical weights (mean-removed).
+
+    If `on_to_off` is provided, OFF weights are re-indexed onto the ON lattice using the mapping
+    (nearest-neighbor ON↔OFF matching), which makes this metric meaningful when ON/OFF mosaics are
+    not perfectly co-registered.
+
+    Positive values indicate ON/OFF weights are spatially similar (bad for push–pull).
+    Negative values indicate phase-opponent ON/OFF structure (push–pull-like).
+    """
+    n_pix = int(N) * int(N)
+    W_on = W[:, :n_pix].astype(np.float64, copy=False)
+    W_off = W[:, n_pix:].astype(np.float64, copy=False)
+
+    if (X_on is not None) and (Y_on is not None) and (X_off is not None) and (Y_off is not None):
+        sig = 0.5 if sigma is None else float(sigma)
+        K_on = _projection_kernel(int(N), X_on, Y_on, sig)   # (G,P)
+        K_off = _projection_kernel(int(N), X_off, Y_off, sig)
+        W_on_g = (W_on @ K_on.T).astype(np.float64, copy=False)   # (M,G)
+        W_off_g = (W_off @ K_off.T).astype(np.float64, copy=False)
+        W_on_g = W_on_g - W_on_g.mean(axis=1, keepdims=True)
+        W_off_g = W_off_g - W_off_g.mean(axis=1, keepdims=True)
+        denom = (np.linalg.norm(W_on_g, axis=1) * np.linalg.norm(W_off_g, axis=1)) + 1e-12
+        return (W_on_g * W_off_g).sum(axis=1) / denom
+
+    if on_to_off is not None:
+        W_off = W_off[:, on_to_off.astype(np.int32, copy=False)]
+
+    W_on = W_on - W_on.mean(axis=1, keepdims=True)
+    W_off = W_off - W_off.mean(axis=1, keepdims=True)
+    denom = (np.linalg.norm(W_on, axis=1) * np.linalg.norm(W_off, axis=1)) + 1e-12
+    return (W_on * W_off).sum(axis=1) / denom
+
+def rf_fft_orientation_metrics(
+    W: np.ndarray,
+    N: int,
+    *,
+    on_to_off: np.ndarray | None = None,
+    X_on: np.ndarray | None = None,
+    Y_on: np.ndarray | None = None,
+    X_off: np.ndarray | None = None,
+    Y_off: np.ndarray | None = None,
+    sigma: float | None = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute orientedness and preferred orientation from the signed RF Wdiff = Won - Woff.
+
+    Uses the doubled-angle vector sum of Fourier power:
+        orientedness = |Σ P(k) e^{i2φ_k}| / Σ P(k)
+        pref = 0.5 * arg(Σ P(k) e^{i2φ_k})  in [0,180)
+
+    This is a weight-based diagnostic (not spike-based) to avoid "spike-sparse" OSI artifacts.
+    """
+    n_pix = int(N) * int(N)
+    M = int(W.shape[0])
+
+    W_on = W[:, :n_pix].astype(np.float64, copy=False)
+    W_off = W[:, n_pix:].astype(np.float64, copy=False)
+
+    if (X_on is not None) and (Y_on is not None) and (X_off is not None) and (Y_off is not None):
+        sig = 0.5 if sigma is None else float(sigma)
+        K_on = _projection_kernel(int(N), X_on, Y_on, sig)
+        K_off = _projection_kernel(int(N), X_off, Y_off, sig)
+        W_on_g = (W_on @ K_on.T).astype(np.float64, copy=False)
+        W_off_g = (W_off @ K_off.T).astype(np.float64, copy=False)
+        Wdiff = (W_on_g - W_off_g).reshape(M, N, N).astype(np.float64, copy=False)
+    else:
+        Won = W_on.reshape(M, N, N).astype(np.float64, copy=False)
+        if on_to_off is not None:
+            W_off = W_off[:, on_to_off.astype(np.int32, copy=False)]
+        Woff = W_off.reshape(M, N, N).astype(np.float64, copy=False)
+        Wdiff = Won - Woff
+
+    Wdiff = Wdiff - Wdiff.mean(axis=(1, 2), keepdims=True)
+
+    F = np.fft.fftshift(np.fft.fft2(Wdiff, axes=(1, 2)), axes=(1, 2))
+    P = (F.real * F.real + F.imag * F.imag)  # power
+    cx = int(N // 2)
+    cy = int(N // 2)
+    P[:, cx, cy] = 0.0
+
+    ys, xs = np.indices((N, N))
+    dx = (xs - cy).astype(np.float64)
+    dy = (ys - cx).astype(np.float64)
+    r = np.sqrt(dx * dx + dy * dy)
+    rmin = 1.0
+    rmax = max(2.0, float(N) / 2.0 - 1.0)
+    mask = (r >= rmin) & (r <= rmax)
+    phi = np.arctan2(dy, dx)[mask]  # spatial-frequency angle
+
+    w = P[:, mask]
+    vec = (w * np.exp(1j * 2.0 * phi)[None, :]).sum(axis=1)
+    denom = w.sum(axis=1) + 1e-12
+    orientedness = np.abs(vec) / denom
+    pref = (0.5 * np.angle(vec)) % np.pi
+    return orientedness.astype(np.float32), np.rad2deg(pref).astype(np.float32)
+
+def rf_grating_match_tuning(
+    W: np.ndarray,
+    N: int,
+    spatial_freq: float,
+    thetas_deg: np.ndarray,
+    *,
+    on_to_off: np.ndarray | None = None,
+    X_on: np.ndarray | None = None,
+    Y_on: np.ndarray | None = None,
+    X_off: np.ndarray | None = None,
+    Y_off: np.ndarray | None = None,
+    sigma: float | None = None,
+) -> np.ndarray:
+    """Weight-based orientation tuning: project Wdiff onto sinusoidal gratings at `spatial_freq`.
+
+    For each orientation θ, compute the maximum (over phase) dot-product amplitude between the
+    signed RF Wdiff = Won - Woff and a sinusoidal grating at θ:
+
+        amp(θ) = sqrt( (Wdiff·cos(gθ))^2 + (Wdiff·sin(gθ))^2 )
+
+    Returns: (M, K) amplitude matrix for K orientations.
+    """
+    n_pix = int(N) * int(N)
+    M = int(W.shape[0])
+    K = int(len(thetas_deg))
+
+    W_on = W[:, :n_pix].astype(np.float64, copy=False)
+    W_off = W[:, n_pix:].astype(np.float64, copy=False)
+
+    if (X_on is not None) and (Y_on is not None) and (X_off is not None) and (Y_off is not None):
+        sig = 0.5 if sigma is None else float(sigma)
+        K_on = _projection_kernel(int(N), X_on, Y_on, sig)
+        K_off = _projection_kernel(int(N), X_off, Y_off, sig)
+        W_on_g = (W_on @ K_on.T).astype(np.float64, copy=False)
+        W_off_g = (W_off @ K_off.T).astype(np.float64, copy=False)
+        Wdiff = (W_on_g - W_off_g).reshape(M, N, N).astype(np.float64, copy=False)
+    else:
+        if on_to_off is not None:
+            W_off = W_off[:, on_to_off.astype(np.int32, copy=False)]
+        Wdiff = (W_on - W_off).reshape(M, N, N).astype(np.float64, copy=False)
+    Wdiff = Wdiff - Wdiff.mean(axis=(1, 2), keepdims=True)
+
+    xs = (np.arange(N, dtype=np.float64) - (N - 1) / 2.0)
+    ys = (np.arange(N, dtype=np.float64) - (N - 1) / 2.0)
+    X, Y = np.meshgrid(xs, ys, indexing="xy")
+
+    amps = np.zeros((M, K), dtype=np.float64)
+    sf = float(spatial_freq)
+    for j, th_deg in enumerate(thetas_deg.astype(np.float64)):
+        th = float(np.deg2rad(th_deg))
+        proj = X * math.cos(th) + Y * math.sin(th)
+        gcos = np.cos(2.0 * math.pi * sf * proj)
+        gsin = np.sin(2.0 * math.pi * sf * proj)
+        gcos -= float(gcos.mean())
+        gsin -= float(gsin.mean())
+        a = (Wdiff * gcos[None, :, :]).sum(axis=(1, 2))
+        b = (Wdiff * gsin[None, :, :]).sum(axis=(1, 2))
+        amps[:, j] = np.sqrt(a * a + b * b)
+
+    return amps.astype(np.float32)
 
 
 def fit_von_mises_180(y: np.ndarray, thetas_deg: np.ndarray) -> Tuple[float, float, float, float, np.ndarray]:
@@ -183,17 +400,20 @@ class Params:
     # If you see mostly-diagonal receptive fields, try increasing `--spatial-freq` (e.g., 0.16–0.24) or N.
     spatial_freq: float = 0.18
     temporal_freq: float = 8.0
-    base_rate: float = 5.0
+    base_rate: float = 1.0
     gain_rate: float = 205.0
 
     # Sparse spot movie (flash-like stimulus).
     # Implemented as a random sparse set of bright/dark pixels that refresh every `spots_frame_ms`.
     spots_density: float = 0.02   # fraction of pixels active per frame (0..1)
-    spots_frame_ms: float = 33.3  # refresh period (ms) ~30 Hz
-    spots_amp: float = 1.0        # luminance amplitude of each spot (+/-amp)
+    # Ohshiro et al. (2011) used 375 ms refresh with randomly positioned bright/dark spots.
+    spots_frame_ms: float = 375.0  # refresh period (ms)
+    spots_amp: float = 3.0         # luminance amplitude of each spot (+/-amp)
+    spots_sigma: float = 1.2       # pixels; <=0 => single-pixel spots, >0 => Gaussian blobs
 
     # Dense random noise stimulus (spatiotemporal white noise).
-    noise_sigma: float = 0.35     # std of pixel luminance noise
+    # NOTE: Defaults aim to produce robust thalamic/cortical spiking during training.
+    noise_sigma: float = 1.0      # std of pixel luminance noise
     noise_clip: float = 2.5       # clip luminance noise to [-clip, +clip]
     noise_frame_ms: float = 16.7  # refresh period (ms) ~60 Hz
 
@@ -210,10 +430,35 @@ class Params:
     rgc_dog_pad: int = 0              # padding (pixels); 0 => auto based on surround sigma
 
     rgc_pos_jitter: float = 0.15  # Break lattice artifacts (fraction of pixel spacing)
+    # ON/OFF mosaics are distinct in real retina/LGN (not perfectly co-registered).
+    # When enabled, ON and OFF RGCs sample the stimulus at slightly different positions.
+    rgc_separate_onoff_mosaics: bool = False
+    rgc_onoff_offset: float = 0.5  # pixels (magnitude of ON↔OFF lattice offset)
+    rgc_onoff_offset_angle_deg: float | None = None  # None => choose a seeded random angle (avoids baked-in axis bias)
+
+    # RGC temporal dynamics (optional).
+    # Real RGC/LGN channels have temporal filtering and refractory effects; these are
+    # turned off by default to preserve prior behavior, but can be enabled for
+    # spot/noise rearing experiments.
+    rgc_temporal_filter: bool = False
+    rgc_tau_fast: float = 10.0   # ms
+    rgc_tau_slow: float = 50.0   # ms
+    rgc_temporal_gain: float = 1.0
+    rgc_refractory_ms: float = 0.0  # absolute refractory (ms); 0 disables
 
     # RGC->LGN synaptic weight (scaled for Izhikevich pA currents)
     # Izhikevich model uses currents ~0-40 pA for typical spiking
     w_rgc_lgn: float = 5.0
+    # Retinogeniculate pooling (RGC->LGN).
+    # Relay-cell center drive pools nearby same-sign RGCs, while weaker opposite-sign
+    # pooling provides an antagonistic surround-like contribution.
+    lgn_pooling: bool = False
+    lgn_pool_sigma_center: float = 0.9
+    lgn_pool_sigma_surround: float = 1.8
+    lgn_pool_same_gain: float = 1.0
+    lgn_pool_opponent_gain: float = 0.18
+    # Optional temporal smoothing of pooled RGC drive before LGN relay spiking.
+    lgn_rgc_tau_ms: float = 0.0
 
     # LGN->V1 weights & delays
     delay_max: int = 12
@@ -256,6 +501,14 @@ class Params:
     homeostasis_rate: float = 0.0  # Learning rate for synaptic scaling (0 disables)
     homeostasis_clip: float = 0.02  # Per-application multiplicative clamp (e.g., 0.02 => [0.98,1.02])
 
+    # Developmental ON/OFF "split constraint" (local synaptic resource conservation).
+    # Inspired by correlation-based RF development models used for spot/noise rearing analyses:
+    # maintain separate ON and OFF synaptic resource pools per postsynaptic neuron, implemented
+    # as slow, local scaling at segment boundaries (not a fast global normalization).
+    split_constraint_rate: float = 0.2   # 0 disables; >0 applies per-segment ON/OFF pool scaling
+    split_constraint_clip: float = 0.02  # clamp per-application multiplicative factor
+    split_constraint_equalize_onoff: bool = True  # target ON and OFF pools to equal total strength
+
     # Intrinsic homeostasis (bias current) for V1 excitatory neurons
     v1_bias_init: float = 0.0
     v1_bias_eta: float = 0.0
@@ -274,6 +527,16 @@ class Params:
 
     # Heterosynaptic (resource-like) depression on postsynaptic spikes
     A_het: float = 0.032
+    # ON/OFF split competition (developmental constraint).
+    # A local heterosynaptic depression term that discourages co-located ON and OFF subfields
+    # from strengthening together under non-oriented stimuli (a spiking analog of the
+    # "split constraint" used in correlation-based RF development models).
+    A_split: float = 0.2
+    # Adaptive gain for split competition based on each neuron's ON/OFF overlap.
+    # High ON/OFF overlap -> stronger split competition; phase-opponent weights -> weaker competition.
+    split_overlap_adaptive: bool = False
+    split_overlap_min: float = 0.6
+    split_overlap_max: float = 1.4
 
     # Weight decay (biologically: synaptic turnover)
     w_decay: float = 0.00000001  # Per-timestep weight decay (slow turnover; ~hours time scale)
@@ -281,6 +544,14 @@ class Params:
     # Local inhibitory circuit parameters
     n_pv_per_ensemble: int = 1  # PV interneurons per ensemble
     n_som_per_ensemble: int = 1  # SOM interneurons per ensemble for lateral inhibition
+    # PV connectivity realism: allow PV to couple to multiple nearby ensembles instead of acting as a
+    # private "shadow" interneuron. Units are in cortical-distance coordinates (same as lateral kernels).
+    # Set to 0 to recover the legacy private PV<->E wiring.
+    pv_in_sigma: float = 0.0   # E -> PV spread
+    pv_out_sigma: float = 0.0  # PV -> E spread
+    # PV<->PV mutual inhibition (optional; current-based inhibitory input to PV).
+    pv_pv_sigma: float = 0.0   # 0 disables
+    w_pv_pv: float = 0.0       # inhibitory current increment onto PV per PV spike
 
     # LGN->PV feedforward inhibition (thalamocortical drive to FS interneurons)
     w_lgn_pv_gain: float = 0.5
@@ -295,7 +566,7 @@ class Params:
     w_pushpull: float = 0.011  # PP->E inhibitory conductance increment
     # Hypothesis knob: whether PP receives ON/OFF-swapped thalamic input (phase opposition).
     # If False, PP still provides LGN-driven inhibition but is not explicitly "push–pull" by construction.
-    pp_onoff_swap: bool = True
+    pp_onoff_swap: bool = False
     pp_plastic: bool = True
     pp_w_init_mean: float = 0.05
     pp_w_init_std: float = 0.02
@@ -329,6 +600,16 @@ class Params:
     som_out_sigma: float = 0.75  # SOM->E spread (more local)
     som_self_inhibit: bool = True
 
+    # VIP interneurons (disinhibitory motif): VIP -> SOM -> E
+    # Set n_vip_per_ensemble=0 to disable (default preserves legacy behavior).
+    n_vip_per_ensemble: int = 0
+    # Local E->VIP recruitment (current-based, delayed by one step like E->PV).
+    w_e_vip: float = 0.0
+    # VIP->SOM inhibition (current-based).
+    w_vip_som: float = 0.0
+    # Optional tonic bias current to VIP (models state/top-down drive in a crude way).
+    vip_bias_current: float = 0.0
+
     # Lateral excitatory connections (between nearby ensembles)
     w_e_e_lateral: float = 0.01
     lateral_sigma: float = 1.5  # Gaussian spread for lateral connections
@@ -346,6 +627,7 @@ class Params:
     tau_ampa: float = 5.0   # AMPA receptor
     tau_gaba: float = 10.0  # GABA receptor
     tau_gaba_rise_pv: float = 1.0  # ms (PV->E synaptic rise; makes inhibition slightly delayed)
+    tau_apical: float = 20.0  # ms (apical/feedback-like excitatory conductance)
 
     # Reversal potentials (for conductance-based synapses)
     E_exc: float = 0.0  # mV (AMPA/NMDA; simplified)
@@ -354,6 +636,21 @@ class Params:
     # Conductance scaling: convert weight-sums into effective synaptic conductances.
     # Roughly, g * (E_exc - V) should be in the same range as the previous current-based drive.
     w_exc_gain: float = 0.015  # ~1/65 for E_exc=0mV and V_rest≈-65mV
+
+    # Apical modulation (minimal two-stream scaffold for future feedback/expectation modeling).
+    # When apical_gain=0, apical drive has no effect (default preserves legacy behavior).
+    apical_gain: float = 0.0
+    apical_threshold: float = 0.0
+    apical_slope: float = 0.1
+
+    # Minimal laminar scaffold: an optional L2/3 excitatory population driven by L4.
+    # This makes "feedback/apical" inputs anatomically interpretable (apical -> L2/3) without
+    # rewriting the existing L4 thalamocortical learning block.
+    laminar_enabled: bool = False
+    # Basal drive from L4 E spikes to L2/3 E conductance (in the same "current weight" units as W_e_e).
+    w_l4_l23: float = 10.0
+    # Spread of L4->L2/3 projections over cortex_dist2 (0 => same-ensemble only).
+    l4_l23_sigma: float = 0.0
 
 
 class IzhikevichPopulation:
@@ -370,8 +667,12 @@ class IzhikevichPopulation:
         self.u = params.b * self.v.copy()
 
         # Small random perturbation to break symmetry
-        self.v += rng.uniform(-5, 5, n).astype(np.float32)
-        self.u += rng.uniform(-2, 2, n).astype(np.float32)
+        self._apply_symmetry_breaking_jitter()
+
+    def _apply_symmetry_breaking_jitter(self) -> None:
+        """Add small random perturbations (models background fluctuations; breaks symmetry)."""
+        self.v += self.rng.uniform(-5, 5, self.n).astype(np.float32)
+        self.u += self.rng.uniform(-2, 2, self.n).astype(np.float32)
 
     def reset(self):
         """Reset to initial state."""
@@ -433,7 +734,16 @@ class TripletSTDP:
     - x_post_slow: slow post trace for triplet
     """
 
-    def __init__(self, n_pre: int, n_post: int, p: Params, rng: np.random.Generator):
+    def __init__(
+        self,
+        n_pre: int,
+        n_post: int,
+        p: Params,
+        rng: np.random.Generator,
+        *,
+        split_on_to_off: np.ndarray | None = None,
+        split_off_to_on: np.ndarray | None = None,
+    ):
         self.n_pre = n_pre
         self.n_post = n_post
         self.p = p
@@ -452,6 +762,12 @@ class TripletSTDP:
         self.decay_pre_slow = math.exp(-p.dt_ms / p.tau_x)
         self.decay_post = math.exp(-p.dt_ms / p.tau_minus)
         self.decay_post_slow = math.exp(-p.dt_ms / p.tau_y)
+
+        self.split_on_to_off: np.ndarray | None = None
+        self.split_off_to_on: np.ndarray | None = None
+        if (split_on_to_off is not None) and (split_off_to_on is not None):
+            self.split_on_to_off = split_on_to_off.astype(np.int32, copy=True)
+            self.split_off_to_on = split_off_to_on.astype(np.int32, copy=True)
 
     def reset(self):
         self.x_pre.fill(0)
@@ -513,6 +829,35 @@ class TripletSTDP:
             if p.A_het > 0:
                 inactive = (1.0 - arrivals).astype(np.float32)
                 dW -= p.A_het * post_mask[:, None] * inactive * W
+
+            # ON/OFF split competition: when a postsynaptic spike occurs, recently active ON inputs
+            # weaken their OFF counterparts (and vice versa). This encourages development of phase-
+            # opponent ON/OFF subfields under non-oriented developmental stimuli (spots/noise),
+            # without requiring any global weight normalization.
+            if p.A_split > 0 and self.n_pre == 2 * p.N * p.N:
+                n_pix = int(p.N) * int(p.N)
+                on_trace = self.x_pre[:, :n_pix]
+                off_trace = self.x_pre[:, n_pix:]
+                split_gain = np.ones_like(post_mask, dtype=np.float32)
+                if p.split_overlap_adaptive:
+                    W_on = W[:, :n_pix]
+                    W_off = W[:, n_pix:]
+                    if self.split_on_to_off is not None:
+                        W_off = W_off[:, self.split_on_to_off]
+                    W_on_c = W_on - W_on.mean(axis=1, keepdims=True)
+                    W_off_c = W_off - W_off.mean(axis=1, keepdims=True)
+                    denom = (np.linalg.norm(W_on_c, axis=1) * np.linalg.norm(W_off_c, axis=1)) + 1e-12
+                    overlap = (W_on_c * W_off_c).sum(axis=1) / denom
+                    overlap = np.clip(0.5 * (overlap + 1.0), 0.0, 1.0)
+                    split_gain = p.split_overlap_min + (p.split_overlap_max - p.split_overlap_min) * overlap
+                if (self.split_on_to_off is None) or (self.split_off_to_on is None):
+                    on_at_off = on_trace
+                    off_at_on = off_trace
+                else:
+                    on_at_off = on_trace[:, self.split_off_to_on]
+                    off_at_on = off_trace[:, self.split_on_to_off]
+                dW[:, n_pix:] -= p.A_split * split_gain[:, None] * post_mask[:, None] * on_at_off * W[:, n_pix:]
+                dW[:, :n_pix] -= p.A_split * split_gain[:, None] * post_mask[:, None] * off_at_on * W[:, :n_pix]
 
         # Update post traces AFTER computing plasticity
         self.x_post += post_spikes.astype(np.float32)
@@ -749,50 +1094,141 @@ class RgcLgnV1Network:
             dy = np.minimum(dy, cortex_h - dy)
         self.cortex_dist2 = (dx * dx + dy * dy).astype(np.float32)
 
-        # Spatial coordinates for stimulus
-        xs = np.arange(p.N) - (p.N - 1) / 2.0
-        ys = np.arange(p.N) - (p.N - 1) / 2.0
-        self.X, self.Y = np.meshgrid(xs, ys, indexing="xy")
-        # Real RGC mosaics are not perfect grids; small positional jitter reduces lattice biases.
-        if p.rgc_pos_jitter > 0:
-            # Important: naive random jitter on a *small* patch can introduce a net shear/dipole,
-            # producing systematic orientation biases across the whole network. Enforce 180° rotational
-            # antisymmetry so the mosaic remains globally centered while still breaking the lattice.
-            j = float(p.rgc_pos_jitter)
-            jx = self.rng.uniform(-j, j, size=self.X.shape).astype(np.float32)
-            jy = self.rng.uniform(-j, j, size=self.Y.shape).astype(np.float32)
-            jx = 0.5 * (jx - jx[::-1, ::-1])
-            jy = 0.5 * (jy - jy[::-1, ::-1])
-            self.X = (self.X + jx).astype(np.float32)
-            self.Y = (self.Y + jy).astype(np.float32)
+        # Spatial coordinates for RGC mosaics (used to sample stimuli and build retinotopic priors).
+        xs = np.arange(p.N, dtype=np.float32) - (p.N - 1) / 2.0
+        ys = np.arange(p.N, dtype=np.float32) - (p.N - 1) / 2.0
+        X0, Y0 = np.meshgrid(xs, ys, indexing="xy")
+        X0 = X0.astype(np.float32, copy=False)
+        Y0 = Y0.astype(np.float32, copy=False)
+
+        # Real ON and OFF mosaics are distinct lattices (not perfectly co-registered).
+        # When enabled, we offset ON and OFF sampling positions and jitter them independently.
+        self.rgc_onoff_offset_angle_deg: float | None = None
+        if p.rgc_separate_onoff_mosaics:
+            mosaic_rng = np.random.default_rng(np.random.SeedSequence([p.seed, 11111, 0]))
+            if p.rgc_onoff_offset_angle_deg is None:
+                ang = float(mosaic_rng.uniform(0.0, 2.0 * math.pi))
+            else:
+                ang = float(math.radians(float(p.rgc_onoff_offset_angle_deg)))
+            self.rgc_onoff_offset_angle_deg = float((math.degrees(ang)) % 360.0)
+            dx = float(p.rgc_onoff_offset) * math.cos(ang)
+            dy = float(p.rgc_onoff_offset) * math.sin(ang)
+            X_on = (X0 - 0.5 * dx).astype(np.float32, copy=True)
+            Y_on = (Y0 - 0.5 * dy).astype(np.float32, copy=True)
+            X_off = (X0 + 0.5 * dx).astype(np.float32, copy=True)
+            Y_off = (Y0 + 0.5 * dy).astype(np.float32, copy=True)
+
+            if p.rgc_pos_jitter > 0:
+                # Important: naive random jitter on a *small* patch can introduce a net shear/dipole,
+                # producing systematic orientation biases across the whole network. Enforce 180° rotational
+                # antisymmetry so each mosaic remains globally centered while still breaking the lattice.
+                j = float(p.rgc_pos_jitter)
+                jx = mosaic_rng.uniform(-j, j, size=X_on.shape).astype(np.float32)
+                jy = mosaic_rng.uniform(-j, j, size=Y_on.shape).astype(np.float32)
+                jx = 0.5 * (jx - jx[::-1, ::-1])
+                jy = 0.5 * (jy - jy[::-1, ::-1])
+                X_on += jx
+                Y_on += jy
+
+                jx = mosaic_rng.uniform(-j, j, size=X_off.shape).astype(np.float32)
+                jy = mosaic_rng.uniform(-j, j, size=Y_off.shape).astype(np.float32)
+                jx = 0.5 * (jx - jx[::-1, ::-1])
+                jy = 0.5 * (jy - jy[::-1, ::-1])
+                X_off += jx
+                Y_off += jy
+
+            self.X_on, self.Y_on = X_on, Y_on
+            self.X_off, self.Y_off = X_off, Y_off
+        else:
+            X = X0.astype(np.float32, copy=True)
+            Y = Y0.astype(np.float32, copy=True)
+            # Real RGC mosaics are not perfect grids; small positional jitter reduces lattice biases.
+            if p.rgc_pos_jitter > 0:
+                # Important: enforce 180° rotational antisymmetry so the mosaic remains globally centered.
+                j = float(p.rgc_pos_jitter)
+                jx = self.rng.uniform(-j, j, size=X.shape).astype(np.float32)
+                jy = self.rng.uniform(-j, j, size=Y.shape).astype(np.float32)
+                jx = 0.5 * (jx - jx[::-1, ::-1])
+                jy = 0.5 * (jy - jy[::-1, ::-1])
+                X += jx
+                Y += jy
+            self.X_on, self.Y_on = X, Y
+            self.X_off, self.Y_off = X.copy(), Y.copy()
+
+        # Backwards-compat aliases: many helper functions use `self.X/self.Y` to mean "the RGC sampling lattice".
+        # In separated-mosaic mode, these refer to the ON mosaic.
+        self.X, self.Y = self.X_on, self.Y_on
 
         # RGC center–surround DoG front-end.
         # Important for biological plausibility AND for avoiding orientation-biased learning: small patches
         # with truncated DoG kernels can introduce systematic oblique biases. The default "padded_fft"
         # implementation filters on a padded field so the central patch sees an approximately translation-
         # invariant DoG response.
-        self.rgc_dog = None  # (N^2,N^2) matrix for legacy "matrix" mode
+        self.rgc_dog_on = None   # (N^2,N^2) matrix for legacy "matrix" mode (ON mosaic)
+        self.rgc_dog_off = None  # (N^2,N^2) matrix for legacy "matrix" mode (OFF mosaic)
         self._rgc_pad = 0
         self._X_pad = None
         self._Y_pad = None
         self._rgc_dog_fft = None  # rfft2 kernel for padded DoG
-        self._rgc_sample_idx00 = None
-        self._rgc_sample_idx10 = None
-        self._rgc_sample_idx01 = None
-        self._rgc_sample_idx11 = None
-        self._rgc_sample_wx = None
-        self._rgc_sample_wy = None
+        # Bilinear samplers from padded fields -> RGC mosaics.
+        self._rgc_on_sample_idx00 = None
+        self._rgc_on_sample_idx10 = None
+        self._rgc_on_sample_idx01 = None
+        self._rgc_on_sample_idx11 = None
+        self._rgc_on_sample_wx = None
+        self._rgc_on_sample_wy = None
+        self._rgc_off_sample_idx00 = None
+        self._rgc_off_sample_idx10 = None
+        self._rgc_off_sample_idx01 = None
+        self._rgc_off_sample_idx11 = None
+        self._rgc_off_sample_wx = None
+        self._rgc_off_sample_wy = None
         self._init_rgc_frontend()
+
+        # RGC->LGN pooling matrix and optional temporal smoothing of retinogeniculate drive.
+        self.W_rgc_lgn = self._build_rgc_lgn_pool_matrix()
+        self._lgn_rgc_drive = np.zeros(self.n_lgn, dtype=np.float32)
+        self._lgn_rgc_alpha = 0.0
+        if p.lgn_rgc_tau_ms > 0:
+            self._lgn_rgc_alpha = float(1.0 - math.exp(-p.dt_ms / max(1e-6, float(p.lgn_rgc_tau_ms))))
+
+        # Optional RGC temporal dynamics (local, per-pixel).
+        # Implemented as a simple biphasic temporal filter (fast - slow) and an optional
+        # absolute refractory period. Disabled by default to preserve prior behavior.
+        self._rgc_drive_fast_on = None
+        self._rgc_drive_slow_on = None
+        self._rgc_drive_fast_off = None
+        self._rgc_drive_slow_off = None
+        self._rgc_alpha_fast = 0.0
+        self._rgc_alpha_slow = 0.0
+        if p.rgc_temporal_filter:
+            self._rgc_drive_fast_on = np.zeros((p.N, p.N), dtype=np.float32)
+            self._rgc_drive_slow_on = np.zeros((p.N, p.N), dtype=np.float32)
+            self._rgc_drive_fast_off = np.zeros((p.N, p.N), dtype=np.float32)
+            self._rgc_drive_slow_off = np.zeros((p.N, p.N), dtype=np.float32)
+            self._rgc_alpha_fast = float(1.0 - math.exp(-p.dt_ms / max(1e-6, float(p.rgc_tau_fast))))
+            self._rgc_alpha_slow = float(1.0 - math.exp(-p.dt_ms / max(1e-6, float(p.rgc_tau_slow))))
+
+        self._rgc_refr_steps = 0
+        self._rgc_refr_on = None
+        self._rgc_refr_off = None
+        if float(p.rgc_refractory_ms) > 0.0:
+            self._rgc_refr_steps = int(math.ceil(float(p.rgc_refractory_ms) / max(1e-6, float(p.dt_ms))))
+            self._rgc_refr_steps = int(max(1, self._rgc_refr_steps))
+            self._rgc_refr_on = np.zeros((p.N, p.N), dtype=np.int16)
+            self._rgc_refr_off = np.zeros((p.N, p.N), dtype=np.int16)
 
         # Retinotopic envelopes (fixed structural locality) for thalamocortical projections.
         # Implemented as a spatially varying *cap* on synaptic weights (far inputs cannot become strong).
-        d2 = (self.X.astype(np.float32) ** 2 + self.Y.astype(np.float32) ** 2)
+        d2_on = (self.X_on.astype(np.float32) ** 2 + self.Y_on.astype(np.float32) ** 2).astype(np.float32)
+        d2_off = (self.X_off.astype(np.float32) ** 2 + self.Y_off.astype(np.float32) ** 2).astype(np.float32)
 
         def lgn_mask_vec(sigma: float) -> np.ndarray:
             if sigma <= 0:
                 return np.ones(self.n_lgn, dtype=np.float32)
-            pix = np.exp(-d2 / (2.0 * float(sigma) * float(sigma))).astype(np.float32).ravel()
-            vec = np.concatenate([pix, pix]).astype(np.float32)  # ON and OFF share the same envelope
+            pix_on = np.exp(-d2_on / (2.0 * float(sigma) * float(sigma))).astype(np.float32).ravel()
+            pix_off = np.exp(-d2_off / (2.0 * float(sigma) * float(sigma))).astype(np.float32).ravel()
+            vec = np.concatenate([pix_on, pix_off]).astype(np.float32)
             vec /= float(vec.max() + 1e-12)
             return vec
 
@@ -805,6 +1241,14 @@ class RgcLgnV1Network:
 
         # --- V1 Excitatory Layer (Regular spiking) ---
         self.v1_exc = IzhikevichPopulation(p.M, RS_PARAMS, p.dt_ms, self.rng)
+
+        # --- Optional L2/3 Excitatory Layer (Regular spiking) ---
+        # Enabled via `Params.laminar_enabled`. This population is driven by L4 and is where
+        # apical/feedback-like modulation is applied (see step()).
+        self.v1_l23 = None
+        if p.laminar_enabled:
+            l23_rng = np.random.default_rng(np.random.SeedSequence([p.seed, 33333, 0]))
+            self.v1_l23 = IzhikevichPopulation(p.M, RS_PARAMS, p.dt_ms, l23_rng)
 
         # --- Local PV Interneurons (Fast spiking) ---
         # One PV per ensemble for local feedforward inhibition
@@ -824,12 +1268,27 @@ class RgcLgnV1Network:
         self.n_som = p.M * p.n_som_per_ensemble
         self.som = IzhikevichPopulation(self.n_som, LTS_PARAMS, p.dt_ms, self.rng)
 
+        # --- VIP Interneurons (disinhibitory: VIP -> SOM -> E), optional ---
+        self.n_vip = p.M * p.n_vip_per_ensemble
+        self.vip = None
+        if self.n_vip > 0:
+            vip_rng = np.random.default_rng(np.random.SeedSequence([p.seed, 22222, 0]))
+            self.vip = IzhikevichPopulation(self.n_vip, RS_PARAMS, p.dt_ms, vip_rng)
+
         # --- Synaptic currents / conductances ---
         self.I_lgn = np.zeros(self.n_lgn, dtype=np.float32)
-        self.g_v1_exc = np.zeros(p.M, dtype=np.float32)  # excitatory AMPA conductance onto V1 E
+        self.g_v1_exc = np.zeros(p.M, dtype=np.float32)  # basal excitatory AMPA conductance onto V1 E
+        self.g_v1_apical = np.zeros(p.M, dtype=np.float32)  # apical/feedback-like excitatory conductance
+        # L2/3 excitatory (optional, laminar mode). These are inert when `v1_l23 is None`.
+        self.g_l23_exc = np.zeros(p.M, dtype=np.float32)
+        self.g_l23_apical = np.zeros(p.M, dtype=np.float32)
+        self.g_l23_inh_som = np.zeros(p.M, dtype=np.float32)
+        self.I_l23_bias = np.zeros(p.M, dtype=np.float32)
         self.I_pv = np.zeros(self.n_pv, dtype=np.float32)
         self.I_pp = np.zeros(self.n_pp, dtype=np.float32)
         self.I_som = np.zeros(self.n_som, dtype=np.float32)
+        self.I_som_inh = np.zeros(self.n_som, dtype=np.float32)  # VIP->SOM inhibition (current-based)
+        self.I_vip = np.zeros(self.n_vip, dtype=np.float32)
 
         # Intrinsic excitability homeostasis (bias current) for V1 excitatory neurons
         self.I_v1_bias = np.full(p.M, p.v1_bias_init, dtype=np.float32)
@@ -853,6 +1312,7 @@ class RgcLgnV1Network:
         self.decay_ampa_pp = math.exp(-p.dt_ms / max(1e-3, p.tau_ampa_pp))
         self.decay_gaba = math.exp(-p.dt_ms / p.tau_gaba)
         self.decay_gaba_rise_pv = math.exp(-p.dt_ms / max(1e-3, p.tau_gaba_rise_pv))
+        self.decay_apical = math.exp(-p.dt_ms / max(1e-3, p.tau_apical))
 
         # Inhibitory conductances onto V1 excitatory neurons.
         # PV inhibition uses a difference-of-exponentials (rise + decay) to avoid unrealistically
@@ -864,6 +1324,7 @@ class RgcLgnV1Network:
 
         # Previous-step spikes (for delayed recurrent effects)
         self.prev_v1_spk = np.zeros(p.M, dtype=np.uint8)
+        self.prev_v1_l23_spk = np.zeros(p.M, dtype=np.uint8)
 
         # --- Delay buffer for LGN->V1 ---
         self.delay_buf = np.zeros((self.L, self.n_lgn), dtype=np.uint8)
@@ -933,7 +1394,25 @@ class RgcLgnV1Network:
         self.W *= self.tc_mask_e_f32
 
         n_pix = p.N * p.N
-        self.pp_swap_idx = np.concatenate([np.arange(n_pix, 2 * n_pix), np.arange(0, n_pix)]).astype(np.int32)
+        # Targets for ON/OFF "split constraint" scaling (local per-neuron resource pools).
+        self.split_target_on = self.W[:, :n_pix].sum(axis=1).astype(np.float32)
+        self.split_target_off = self.W[:, n_pix:].sum(axis=1).astype(np.float32)
+        if p.split_constraint_equalize_onoff:
+            tgt = 0.5 * (self.split_target_on + self.split_target_off)
+            self.split_target_on = tgt.astype(np.float32, copy=False)
+            self.split_target_off = tgt.astype(np.float32, copy=False)
+
+        # Nearest-neighbor ON↔OFF matching based on mosaic coordinates.
+        # Used by developmental ON/OFF competition and by the optional PP ON/OFF swap.
+        on_pos = np.stack([self.X_on.ravel(), self.Y_on.ravel()], axis=1).astype(np.float32, copy=False)
+        off_pos = np.stack([self.X_off.ravel(), self.Y_off.ravel()], axis=1).astype(np.float32, copy=False)
+        d2_onoff = np.square(on_pos[:, None, :] - off_pos[None, :, :]).sum(axis=2)
+        self.on_to_off = np.argmin(d2_onoff, axis=1).astype(np.int32, copy=False)
+        self.off_to_on = np.argmin(d2_onoff, axis=0).astype(np.int32, copy=False)
+
+        self.pp_swap_idx = np.empty(2 * n_pix, dtype=np.int32)
+        self.pp_swap_idx[:n_pix] = n_pix + self.on_to_off
+        self.pp_swap_idx[n_pix:] = self.off_to_on
 
         # --- Push–pull thalamic weights (LGN -> PP interneurons) ---
         # Bias initial LGN->PP weights to be correlated with LGN->E weights (same retinotopic pool),
@@ -970,12 +1449,21 @@ class RgcLgnV1Network:
             self.D_pp[pp_idx, :] = self.D[parent, :]
 
         # --- Local inhibitory connectivity ---
-        # E->PV connectivity (each E connects to its local PV)
-        self.W_e_pv = np.zeros((self.n_pv, p.M), dtype=np.float32)
-        for m in range(p.M):
-            pv_start = m * p.n_pv_per_ensemble
-            pv_end = pv_start + p.n_pv_per_ensemble
-            self.W_e_pv[pv_start:pv_end, m] = p.w_e_pv
+        pv_parent = (np.arange(self.n_pv, dtype=np.int32) // max(1, int(p.n_pv_per_ensemble))).astype(np.int32, copy=False)
+
+        # E->PV connectivity (local-to-nearby by default; sigma=0 recovers legacy private wiring).
+        if float(p.pv_in_sigma) <= 0.0:
+            self.W_e_pv = np.zeros((self.n_pv, p.M), dtype=np.float32)
+            for m in range(p.M):
+                pv_start = m * p.n_pv_per_ensemble
+                pv_end = pv_start + p.n_pv_per_ensemble
+                self.W_e_pv[pv_start:pv_end, m] = p.w_e_pv
+        else:
+            sig = float(p.pv_in_sigma)
+            d2_pv_e = self.cortex_dist2[pv_parent, :].astype(np.float32, copy=False)  # (n_pv, M)
+            k = np.exp(-d2_pv_e / (2.0 * sig * sig)).astype(np.float32)
+            k_sum = k.sum(axis=1, keepdims=True) + 1e-12
+            self.W_e_pv = (float(p.w_e_pv) * (k / k_sum)).astype(np.float32, copy=False)
 
         # PP->E connectivity (local push–pull inhibition)
         self.W_pp_e = np.zeros((p.M, self.n_pp), dtype=np.float32)
@@ -985,13 +1473,32 @@ class RgcLgnV1Network:
             # Divide by n_pp_per_ensemble so total inhibition per ensemble stays comparable.
             self.W_pp_e[m, pp_start:pp_end] = p.w_pushpull / max(1, p.n_pp_per_ensemble)
 
-        # PV->E connectivity (local inhibition only)
-        self.W_pv_e = np.zeros((p.M, self.n_pv), dtype=np.float32)
-        for m in range(p.M):
-            pv_start = m * p.n_pv_per_ensemble
-            pv_end = pv_start + p.n_pv_per_ensemble
-            self.W_pv_e[m, pv_start:pv_end] = p.w_pv_e
+        # PV->E connectivity (local-to-nearby by default; sigma=0 recovers legacy private wiring).
+        if float(p.pv_out_sigma) <= 0.0:
+            self.W_pv_e = np.zeros((p.M, self.n_pv), dtype=np.float32)
+            for m in range(p.M):
+                pv_start = m * p.n_pv_per_ensemble
+                pv_end = pv_start + p.n_pv_per_ensemble
+                self.W_pv_e[m, pv_start:pv_end] = p.w_pv_e
+        else:
+            sig = float(p.pv_out_sigma)
+            d2_e_pv = self.cortex_dist2[:, pv_parent].astype(np.float32, copy=False)  # (M, n_pv)
+            k = np.exp(-d2_e_pv / (2.0 * sig * sig)).astype(np.float32)
+            k_sum = k.sum(axis=1, keepdims=True) + 1e-12
+            target_total = float(p.w_pv_e) * float(max(1, int(p.n_pv_per_ensemble)))
+            self.W_pv_e = (target_total * (k / k_sum)).astype(np.float32, copy=False)
         self.mask_pv_e = (self.W_pv_e > 0)
+
+        # PV<->PV coupling (optional).
+        self.W_pv_pv = None
+        self.I_pv_inh = np.zeros(self.n_pv, dtype=np.float32)
+        if (float(p.pv_pv_sigma) > 0.0) and (float(p.w_pv_pv) > 0.0):
+            sig = float(p.pv_pv_sigma)
+            d2_pv_pv = self.cortex_dist2[pv_parent[:, None], pv_parent[None, :]].astype(np.float32, copy=False)
+            k = np.exp(-d2_pv_pv / (2.0 * sig * sig)).astype(np.float32)
+            np.fill_diagonal(k, 0.0)
+            k_sum = k.sum(axis=1, keepdims=True) + 1e-12
+            self.W_pv_pv = (float(p.w_pv_pv) * (k / k_sum)).astype(np.float32, copy=False)
 
         # E->SOM connectivity (can be long-range): E activity recruits SOM near the target site,
         # producing disynaptic long-range suppression without literal long-range inhibitory axons.
@@ -1018,6 +1525,21 @@ class RgcLgnV1Network:
             kernel /= float(kernel.sum() + 1e-12)
             self.W_som_e[:, som_idx] = p.w_som_e * kernel
 
+        # VIP connectivity (local disinhibition): E -> VIP -> SOM.
+        self.W_e_vip = np.zeros((self.n_vip, p.M), dtype=np.float32)
+        self.W_vip_som = np.zeros((self.n_som, self.n_vip), dtype=np.float32)
+        if self.n_vip > 0:
+            for m in range(p.M):
+                vip_start = m * p.n_vip_per_ensemble
+                vip_end = vip_start + p.n_vip_per_ensemble
+                self.W_e_vip[vip_start:vip_end, m] = p.w_e_vip
+                som_start = m * p.n_som_per_ensemble
+                som_end = som_start + p.n_som_per_ensemble
+                if p.w_vip_som != 0.0:
+                    self.W_vip_som[som_start:som_end, vip_start:vip_end] = float(p.w_vip_som) / max(
+                        1, int(p.n_vip_per_ensemble)
+                    )
+
         # --- Lateral excitatory connectivity ---
         # Gaussian connectivity based on cortical distance (1×M ring by default).
         self.W_e_e = np.zeros((p.M, p.M), dtype=np.float32)
@@ -1030,8 +1552,29 @@ class RgcLgnV1Network:
         self.mask_e_e = np.ones((p.M, p.M), dtype=bool)
         np.fill_diagonal(self.mask_e_e, False)
 
+        # --- Laminar (L4 -> L2/3) connectivity (optional) ---
+        # Implemented as a fixed Gaussian kernel on the same cortical geometry used for lateral E->E.
+        self.W_l4_l23 = None
+        if p.laminar_enabled:
+            self.W_l4_l23 = np.zeros((p.M, p.M), dtype=np.float32)
+            sig = float(p.l4_l23_sigma)
+            if sig <= 0.0:
+                np.fill_diagonal(self.W_l4_l23, float(p.w_l4_l23))
+            else:
+                for post in range(p.M):
+                    kernel = np.exp(-self.cortex_dist2[:, post] / (2.0 * sig * sig)).astype(np.float32)
+                    kernel /= float(kernel.sum() + 1e-12)
+                    self.W_l4_l23[post, :] = float(p.w_l4_l23) * kernel
+
         # --- Plasticity mechanisms ---
-        self.stdp = TripletSTDP(self.n_lgn, p.M, p, self.rng)
+        self.stdp = TripletSTDP(
+            self.n_lgn,
+            p.M,
+            p,
+            self.rng,
+            split_on_to_off=self.on_to_off,
+            split_off_to_on=self.off_to_on,
+        )
         self.pp_stdp = PairSTDP(
             self.n_lgn,
             self.n_pp,
@@ -1053,23 +1596,24 @@ class RgcLgnV1Network:
             return
         impl = str(p.rgc_dog_impl).lower()
         if impl == "matrix":
-            self.rgc_dog = self._build_rgc_dog_filter_matrix()
+            self.rgc_dog_on = self._build_rgc_dog_filter_matrix(self.X_on, self.Y_on)
+            self.rgc_dog_off = self._build_rgc_dog_filter_matrix(self.X_off, self.Y_off)
             return
         if impl == "padded_fft":
             self._setup_rgc_dog_padded_fft()
             return
         raise ValueError("rgc_dog_impl must be one of: 'matrix', 'padded_fft'")
 
-    def _build_rgc_dog_filter_matrix(self) -> np.ndarray:
-        """Build an (N^2, N^2) DoG filter using the (jittered) RGC coordinates (legacy mode)."""
+    def _build_rgc_dog_filter_matrix(self, X: np.ndarray, Y: np.ndarray) -> np.ndarray:
+        """Build an (N^2, N^2) DoG filter using the provided RGC coordinates (legacy mode)."""
         p = self.p
         if p.rgc_center_sigma <= 0.0 or p.rgc_surround_sigma <= 0.0:
             raise ValueError("rgc_center_sigma and rgc_surround_sigma must be > 0 for DoG filtering")
         if p.rgc_surround_sigma <= p.rgc_center_sigma:
             raise ValueError("rgc_surround_sigma must be > rgc_center_sigma for a center–surround DoG")
 
-        x = self.X.astype(np.float32).ravel()
-        y = self.Y.astype(np.float32).ravel()
+        x = X.astype(np.float32).ravel()
+        y = Y.astype(np.float32).ravel()
         n_pix = int(x.size)
 
         dx = x[:, None] - x[None, :]
@@ -1152,54 +1696,153 @@ class RgcLgnV1Network:
 
         self._rgc_dog_fft = np.fft.rfft2(dog.astype(np.float32, copy=False))
 
-        # Precompute bilinear sampling indices/weights from the padded field to the (possibly jittered)
-        # RGC mosaic locations in the central patch.
-        fx = self.X.astype(np.float32).ravel() + (n - 1) / 2.0
-        fy = self.Y.astype(np.float32).ravel() + (n - 1) / 2.0
+        def build_sampler(X: np.ndarray, Y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            fx = X.astype(np.float32).ravel() + (n - 1) / 2.0
+            fy = Y.astype(np.float32).ravel() + (n - 1) / 2.0
 
-        x0 = np.floor(fx).astype(np.int32)
-        y0 = np.floor(fy).astype(np.int32)
-        wx = (fx - x0).astype(np.float32)
-        wy = (fy - y0).astype(np.float32)
-        x1 = x0 + 1
-        y1 = y0 + 1
+            x0 = np.floor(fx).astype(np.int32)
+            y0 = np.floor(fy).astype(np.int32)
+            wx = (fx - x0).astype(np.float32)
+            wy = (fy - y0).astype(np.float32)
+            x1 = x0 + 1
+            y1 = y0 + 1
 
-        x0 = np.clip(x0, 0, n - 1)
-        y0 = np.clip(y0, 0, n - 1)
-        x1 = np.clip(x1, 0, n - 1)
-        y1 = np.clip(y1, 0, n - 1)
+            x0 = np.clip(x0, 0, n - 1)
+            y0 = np.clip(y0, 0, n - 1)
+            x1 = np.clip(x1, 0, n - 1)
+            y1 = np.clip(y1, 0, n - 1)
 
-        self._rgc_sample_idx00 = (y0 * n + x0).astype(np.int32)
-        self._rgc_sample_idx10 = (y0 * n + x1).astype(np.int32)
-        self._rgc_sample_idx01 = (y1 * n + x0).astype(np.int32)
-        self._rgc_sample_idx11 = (y1 * n + x1).astype(np.int32)
-        self._rgc_sample_wx = wx
-        self._rgc_sample_wy = wy
+            idx00 = (y0 * n + x0).astype(np.int32)
+            idx10 = (y0 * n + x1).astype(np.int32)
+            idx01 = (y1 * n + x0).astype(np.int32)
+            idx11 = (y1 * n + x1).astype(np.int32)
+            return idx00, idx10, idx01, idx11, wx, wy
+
+        (
+            self._rgc_on_sample_idx00,
+            self._rgc_on_sample_idx10,
+            self._rgc_on_sample_idx01,
+            self._rgc_on_sample_idx11,
+            self._rgc_on_sample_wx,
+            self._rgc_on_sample_wy,
+        ) = build_sampler(self.X_on, self.Y_on)
+
+        (
+            self._rgc_off_sample_idx00,
+            self._rgc_off_sample_idx10,
+            self._rgc_off_sample_idx01,
+            self._rgc_off_sample_idx11,
+            self._rgc_off_sample_wx,
+            self._rgc_off_sample_wy,
+        ) = build_sampler(self.X_off, self.Y_off)
+
+    def _build_rgc_lgn_pool_matrix(self) -> np.ndarray:
+        """Build retinogeniculate pooling matrix (same-sign center + opponent surround)."""
+        p = self.p
+        n_pix = int(p.N) * int(p.N)
+        n_lgn = 2 * n_pix
+
+        if not p.lgn_pooling:
+            return np.eye(n_lgn, dtype=np.float32)
+
+        X_on = self.X_on.astype(np.float32).ravel()
+        Y_on = self.Y_on.astype(np.float32).ravel()
+        X_off = self.X_off.astype(np.float32).ravel()
+        Y_off = self.Y_off.astype(np.float32).ravel()
+
+        dx = X_on[:, None] - X_on[None, :]
+        dy = Y_on[:, None] - Y_on[None, :]
+        d2_on = (dx * dx + dy * dy).astype(np.float32)
+
+        dx = X_off[:, None] - X_off[None, :]
+        dy = Y_off[:, None] - Y_off[None, :]
+        d2_off = (dx * dx + dy * dy).astype(np.float32)
+
+        dx = X_on[:, None] - X_off[None, :]
+        dy = Y_on[:, None] - Y_off[None, :]
+        d2_onoff = (dx * dx + dy * dy).astype(np.float32)
+
+        dx = X_off[:, None] - X_on[None, :]
+        dy = Y_off[:, None] - Y_on[None, :]
+        d2_offon = (dx * dx + dy * dy).astype(np.float32)
+
+        sig_c = max(1e-6, float(p.lgn_pool_sigma_center))
+        sig_s = max(1e-6, float(p.lgn_pool_sigma_surround))
+        same_on = np.exp(-d2_on / (2.0 * sig_c * sig_c)).astype(np.float32)
+        same_off = np.exp(-d2_off / (2.0 * sig_c * sig_c)).astype(np.float32)
+        opp_onoff = np.exp(-d2_onoff / (2.0 * sig_s * sig_s)).astype(np.float32)
+        opp_offon = np.exp(-d2_offon / (2.0 * sig_s * sig_s)).astype(np.float32)
+
+        same_on /= (same_on.sum(axis=1, keepdims=True) + 1e-12)
+        same_off /= (same_off.sum(axis=1, keepdims=True) + 1e-12)
+        opp_onoff /= (opp_onoff.sum(axis=1, keepdims=True) + 1e-12)
+        opp_offon /= (opp_offon.sum(axis=1, keepdims=True) + 1e-12)
+
+        w_same = float(p.lgn_pool_same_gain)
+        w_opp = float(p.lgn_pool_opponent_gain)
+        mat = np.zeros((n_lgn, n_lgn), dtype=np.float32)
+        # ON relay: ON-center pool, OFF opponent surround
+        mat[:n_pix, :n_pix] = w_same * same_on
+        mat[:n_pix, n_pix:] = -w_opp * opp_onoff
+        # OFF relay: OFF-center pool, ON opponent surround
+        mat[n_pix:, n_pix:] = w_same * same_off
+        mat[n_pix:, :n_pix] = -w_opp * opp_offon
+        return mat
 
     def reset_state(self) -> None:
         """Reset all dynamic state (but not weights)."""
         self.lgn.reset()
         self.v1_exc.reset()
+        if self.v1_l23 is not None:
+            self.v1_l23.reset()
         self.pv.reset()
         self.pp.reset()
         self.som.reset()
+        if self.vip is not None:
+            self.vip.reset()
+
+        if self._rgc_drive_fast_on is not None:
+            self._rgc_drive_fast_on.fill(0.0)
+        if self._rgc_drive_slow_on is not None:
+            self._rgc_drive_slow_on.fill(0.0)
+        if self._rgc_drive_fast_off is not None:
+            self._rgc_drive_fast_off.fill(0.0)
+        if self._rgc_drive_slow_off is not None:
+            self._rgc_drive_slow_off.fill(0.0)
+        if self._rgc_refr_on is not None:
+            self._rgc_refr_on.fill(0)
+        if self._rgc_refr_off is not None:
+            self._rgc_refr_off.fill(0)
+        self._lgn_rgc_drive.fill(0.0)
 
         self.I_lgn.fill(0)
         self.g_v1_exc.fill(0)
+        self.g_v1_apical.fill(0)
+        self.g_l23_exc.fill(0)
+        self.g_l23_apical.fill(0)
+        self.g_l23_inh_som.fill(0)
+        self.I_l23_bias.fill(0)
         self.I_pv.fill(0)
+        self.I_pv_inh.fill(0)
         self.I_pp.fill(0)
         self.I_som.fill(0)
+        self.I_som_inh.fill(0)
+        if self.I_vip.size:
+            self.I_vip.fill(0)
         self.g_v1_inh_pv_rise.fill(0)
         self.g_v1_inh_pv_decay.fill(0)
         self.g_v1_inh_som.fill(0)
         self.g_v1_inh_pp.fill(0)
         self.prev_v1_spk.fill(0)
+        self.prev_v1_l23_spk.fill(0)
 
         self.delay_buf.fill(0)
         self.ptr = 0
 
         if self.tc_stp_x is not None:
             self.tc_stp_x.fill(1.0)
+        if self.tc_stp_x_pv is not None:
+            self.tc_stp_x_pv.fill(1.0)
 
         self.stdp.reset()
         self.pp_stdp.reset()
@@ -1221,8 +1864,48 @@ class RgcLgnV1Network:
         """Generate drifting grating stimulus on the RGC mosaic coordinates."""
         return self.grating_on_coords(theta_deg, t_ms, phase, self.X, self.Y)
 
-    def _rgc_drive_from_pad_stimulus(self, stim_pad: np.ndarray, *, contrast: float) -> np.ndarray:
-        """Apply padded DoG filtering to an arbitrary stimulus on the padded grid, then sample to the mosaic."""
+    def _rgc_sample_from_pad_field(self, field_pad: np.ndarray, *, mosaic: str) -> np.ndarray:
+        """Bilinearly sample a padded field to the ON or OFF RGC mosaic."""
+        if mosaic == "on":
+            idx00 = self._rgc_on_sample_idx00
+            idx10 = self._rgc_on_sample_idx10
+            idx01 = self._rgc_on_sample_idx01
+            idx11 = self._rgc_on_sample_idx11
+            wx = self._rgc_on_sample_wx
+            wy = self._rgc_on_sample_wy
+        elif mosaic == "off":
+            idx00 = self._rgc_off_sample_idx00
+            idx10 = self._rgc_off_sample_idx10
+            idx01 = self._rgc_off_sample_idx01
+            idx11 = self._rgc_off_sample_idx11
+            wx = self._rgc_off_sample_wx
+            wy = self._rgc_off_sample_wy
+        else:
+            raise ValueError("mosaic must be one of: 'on', 'off'")
+
+        if (
+            (idx00 is None)
+            or (idx10 is None)
+            or (idx01 is None)
+            or (idx11 is None)
+            or (wx is None)
+            or (wy is None)
+        ):
+            raise RuntimeError("padded sampler not initialized (need rgc_dog_impl='padded_fft')")
+
+        flat = field_pad.ravel()
+        v00 = flat[idx00]
+        v10 = flat[idx10]
+        v01 = flat[idx01]
+        v11 = flat[idx11]
+
+        omx = (1.0 - wx).astype(np.float32, copy=False)
+        omy = (1.0 - wy).astype(np.float32, copy=False)
+        out = (omx * omy) * v00 + (wx * omy) * v10 + (omx * wy) * v01 + (wx * wy) * v11
+        return out.reshape(self.N, self.N).astype(np.float32, copy=False)
+
+    def _rgc_drives_from_pad_stimulus(self, stim_pad: np.ndarray, *, contrast: float) -> tuple[np.ndarray, np.ndarray]:
+        """Apply padded DoG filtering to a stimulus on the padded grid, then sample to (ON,OFF) mosaics."""
         if self._rgc_dog_fft is None:
             raise RuntimeError("padded_fft DoG front-end not initialized")
         stim_pad = (contrast * stim_pad).astype(np.float32, copy=False)
@@ -1231,34 +1914,42 @@ class RgcLgnV1Network:
             s=stim_pad.shape,
         ).astype(np.float32, copy=False)
 
-        flat = dog_pad.ravel()
-        v00 = flat[self._rgc_sample_idx00]
-        v10 = flat[self._rgc_sample_idx10]
-        v01 = flat[self._rgc_sample_idx01]
-        v11 = flat[self._rgc_sample_idx11]
+        return (
+            self._rgc_sample_from_pad_field(dog_pad, mosaic="on"),
+            self._rgc_sample_from_pad_field(dog_pad, mosaic="off"),
+        )
 
-        wx = self._rgc_sample_wx
-        wy = self._rgc_sample_wy
-        omx = (1.0 - wx).astype(np.float32, copy=False)
-        omy = (1.0 - wy).astype(np.float32, copy=False)
-
-        out = (omx * omy) * v00 + (wx * omy) * v10 + (omx * wy) * v01 + (wx * wy) * v11
-        return out.reshape(self.N, self.N).astype(np.float32, copy=False)
-
-    def rgc_drive_grating(self, theta_deg: float, t_ms: float, phase: float, *,
-                          contrast: float = 1.0) -> np.ndarray:
-        """Compute the RGC 'drive' field (after optional DoG filtering) for a drifting grating."""
+    def rgc_drives_grating(
+        self,
+        theta_deg: float,
+        t_ms: float,
+        phase: float,
+        *,
+        contrast: float = 1.0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute the (ON, OFF) RGC drive fields for a drifting grating."""
         p = self.p
 
         if not p.rgc_center_surround:
-            return (contrast * self.grating(theta_deg, t_ms, phase)).astype(np.float32, copy=False)
+            drive_on = (contrast * self.grating_on_coords(theta_deg, t_ms, phase, self.X_on, self.Y_on)).astype(
+                np.float32, copy=False
+            )
+            drive_off = (contrast * self.grating_on_coords(theta_deg, t_ms, phase, self.X_off, self.Y_off)).astype(
+                np.float32, copy=False
+            )
+            return drive_on, drive_off
 
         impl = str(p.rgc_dog_impl).lower()
         if impl == "matrix":
-            stim = self.grating(theta_deg, t_ms, phase)
-            stim_c = (contrast * stim).astype(np.float32, copy=False)
-            stim_vec = stim_c.ravel()
-            return (self.rgc_dog @ stim_vec).reshape(stim.shape).astype(np.float32, copy=False)
+            stim_on = self.grating_on_coords(theta_deg, t_ms, phase, self.X_on, self.Y_on)
+            stim_off = self.grating_on_coords(theta_deg, t_ms, phase, self.X_off, self.Y_off)
+            stim_on = (contrast * stim_on).astype(np.float32, copy=False)
+            stim_off = (contrast * stim_off).astype(np.float32, copy=False)
+            if self.rgc_dog_on is None or self.rgc_dog_off is None:
+                raise RuntimeError("matrix DoG front-end not initialized")
+            drive_on = (self.rgc_dog_on @ stim_on.ravel()).reshape(stim_on.shape).astype(np.float32, copy=False)
+            drive_off = (self.rgc_dog_off @ stim_off.ravel()).reshape(stim_off.shape).astype(np.float32, copy=False)
+            return drive_on, drive_off
 
         if impl != "padded_fft":
             raise ValueError("rgc_dog_impl must be one of: 'matrix', 'padded_fft'")
@@ -1266,45 +1957,118 @@ class RgcLgnV1Network:
             raise RuntimeError("padded_fft DoG front-end not initialized")
 
         stim_pad = self.grating_on_coords(theta_deg, t_ms, phase, self._X_pad, self._Y_pad)
-        return self._rgc_drive_from_pad_stimulus(stim_pad, contrast=contrast)
+        return self._rgc_drives_from_pad_stimulus(stim_pad, contrast=contrast)
+
+    def rgc_drive_grating(self, theta_deg: float, t_ms: float, phase: float, *, contrast: float = 1.0) -> np.ndarray:
+        """Backwards-compatible single drive accessor (returns ON drive)."""
+        drive_on, _ = self.rgc_drives_grating(theta_deg, t_ms, phase, contrast=contrast)
+        return drive_on
+
+    def rgc_spikes_from_drives(self, drive_on: np.ndarray, drive_off: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Generate ON and OFF RGC spikes from separate (ON,OFF) drive fields."""
+        p = self.p
+
+        drive_on_f = drive_on
+        drive_off_f = drive_off
+        if p.rgc_temporal_filter:
+            # Simple biphasic temporal filtering: fast - slow (per mosaic).
+            if (
+                (self._rgc_drive_fast_on is None)
+                or (self._rgc_drive_slow_on is None)
+                or (self._rgc_drive_fast_off is None)
+                or (self._rgc_drive_slow_off is None)
+            ):
+                self._rgc_drive_fast_on = np.zeros_like(drive_on, dtype=np.float32)
+                self._rgc_drive_slow_on = np.zeros_like(drive_on, dtype=np.float32)
+                self._rgc_drive_fast_off = np.zeros_like(drive_off, dtype=np.float32)
+                self._rgc_drive_slow_off = np.zeros_like(drive_off, dtype=np.float32)
+                self._rgc_alpha_fast = float(1.0 - math.exp(-p.dt_ms / max(1e-6, float(p.rgc_tau_fast))))
+                self._rgc_alpha_slow = float(1.0 - math.exp(-p.dt_ms / max(1e-6, float(p.rgc_tau_slow))))
+
+            self._rgc_drive_fast_on += self._rgc_alpha_fast * (drive_on - self._rgc_drive_fast_on)
+            self._rgc_drive_slow_on += self._rgc_alpha_slow * (drive_on - self._rgc_drive_slow_on)
+            drive_on_f = float(p.rgc_temporal_gain) * (self._rgc_drive_fast_on - self._rgc_drive_slow_on)
+
+            self._rgc_drive_fast_off += self._rgc_alpha_fast * (drive_off - self._rgc_drive_fast_off)
+            self._rgc_drive_slow_off += self._rgc_alpha_slow * (drive_off - self._rgc_drive_slow_off)
+            drive_off_f = float(p.rgc_temporal_gain) * (self._rgc_drive_fast_off - self._rgc_drive_slow_off)
+
+        on_rate = p.base_rate + p.gain_rate * np.clip(drive_on_f, 0, None)
+        off_rate = p.base_rate + p.gain_rate * np.clip(-drive_off_f, 0, None)
+        dt_s = p.dt_ms / 1000.0
+        if self._rgc_refr_on is None or self._rgc_refr_off is None:
+            on_spk = (self.rng.random(drive_on.shape) < (on_rate * dt_s)).astype(np.uint8)
+            off_spk = (self.rng.random(drive_off.shape) < (off_rate * dt_s)).astype(np.uint8)
+            return on_spk, off_spk
+
+        # Absolute refractory: suppress spiking for a fixed number of timesteps after a spike.
+        np.maximum(self._rgc_refr_on - 1, 0, out=self._rgc_refr_on)
+        np.maximum(self._rgc_refr_off - 1, 0, out=self._rgc_refr_off)
+        can_on = (self._rgc_refr_on == 0)
+        can_off = (self._rgc_refr_off == 0)
+        on_spk_b = (self.rng.random(drive_on.shape) < (on_rate * dt_s)) & can_on
+        off_spk_b = (self.rng.random(drive_off.shape) < (off_rate * dt_s)) & can_off
+        self._rgc_refr_on[on_spk_b] = int(self._rgc_refr_steps)
+        self._rgc_refr_off[off_spk_b] = int(self._rgc_refr_steps)
+        return on_spk_b.astype(np.uint8), off_spk_b.astype(np.uint8)
 
     def rgc_spikes_from_drive(self, drive: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Generate ON and OFF RGC spikes from a contrast-like drive field."""
-        p = self.p
-        on_rate = p.base_rate + p.gain_rate * np.clip(drive, 0, None)
-        off_rate = p.base_rate + p.gain_rate * np.clip(-drive, 0, None)
-        dt_s = p.dt_ms / 1000.0
-        on_spk = (self.rng.random(drive.shape) < (on_rate * dt_s)).astype(np.uint8)
-        off_spk = (self.rng.random(drive.shape) < (off_rate * dt_s)).astype(np.uint8)
-        return on_spk, off_spk
+        """Backwards-compatible ON/OFF spikes from a single shared drive field."""
+        return self.rgc_spikes_from_drives(drive, drive)
 
     def rgc_spikes_grating(self, theta_deg: float, t_ms: float, phase: float, *,
                            contrast: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
         """Generate ON and OFF RGC spikes for a drifting grating (preferred code path)."""
-        drive = self.rgc_drive_grating(theta_deg, t_ms, phase, contrast=contrast)
-        return self.rgc_spikes_from_drive(drive)
+        drive_on, drive_off = self.rgc_drives_grating(theta_deg, t_ms, phase, contrast=contrast)
+        return self.rgc_spikes_from_drives(drive_on, drive_off)
 
-    def rgc_spikes(self, stim: np.ndarray, *, contrast: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+    def rgc_spikes(
+        self,
+        stim_on: np.ndarray,
+        *,
+        contrast: float = 1.0,
+        stim_off: np.ndarray | None = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Generate ON and OFF RGC spikes from an explicit stimulus field sampled at RGC positions.
+        Generate ON and OFF RGC spikes from explicit stimulus fields sampled at ON/OFF RGC positions.
 
         Note: When `rgc_dog_impl='padded_fft'`, gratings should be passed via `rgc_spikes_grating(...)`
         so the DoG can be computed on a padded field (avoids edge-induced orientation bias).
         """
         p = self.p
-        stim_c = (contrast * stim).astype(np.float32, copy=False)
-        if p.rgc_center_surround:
-            impl = str(p.rgc_dog_impl).lower()
-            if impl == "matrix":
-                stim_vec = stim_c.ravel()
-                stim_c = (self.rgc_dog @ stim_vec).reshape(stim.shape).astype(np.float32, copy=False)
-            elif impl == "padded_fft":
-                raise ValueError("rgc_spikes(stim) is ambiguous in padded_fft mode; use rgc_spikes_grating(...)")
-            else:
-                raise ValueError("rgc_dog_impl must be one of: 'matrix', 'padded_fft'")
-        return self.rgc_spikes_from_drive(stim_c)
+        if stim_off is None:
+            stim_off = stim_on
+        stim_on = stim_on.astype(np.float32, copy=False)
+        stim_off = stim_off.astype(np.float32, copy=False)
 
-    def step(self, on_spk: np.ndarray, off_spk: np.ndarray, plastic: bool) -> np.ndarray:
+        if not p.rgc_center_surround:
+            drive_on = (contrast * stim_on).astype(np.float32, copy=False)
+            drive_off = (contrast * stim_off).astype(np.float32, copy=False)
+            return self.rgc_spikes_from_drives(drive_on, drive_off)
+
+        impl = str(p.rgc_dog_impl).lower()
+        if impl == "matrix":
+            if self.rgc_dog_on is None or self.rgc_dog_off is None:
+                raise RuntimeError("matrix DoG front-end not initialized")
+            drive_on = (self.rgc_dog_on @ (contrast * stim_on).ravel()).reshape(stim_on.shape).astype(np.float32, copy=False)
+            drive_off = (self.rgc_dog_off @ (contrast * stim_off).ravel()).reshape(stim_off.shape).astype(np.float32, copy=False)
+            return self.rgc_spikes_from_drives(drive_on, drive_off)
+        if impl == "padded_fft":
+            raise ValueError(
+                "rgc_spikes(stim) is ambiguous in padded_fft mode; use rgc_spikes_grating(...) "
+                "or the padded stimulus path (_rgc_drives_from_pad_stimulus)"
+            )
+        raise ValueError("rgc_dog_impl must be one of: 'matrix', 'padded_fft'")
+
+    def step(
+        self,
+        on_spk: np.ndarray,
+        off_spk: np.ndarray,
+        plastic: bool,
+        *,
+        vip_td: float = 0.0,
+        apical_drive: np.ndarray | None = None,
+    ) -> np.ndarray:
         """
         Advance network by one timestep.
 
@@ -1314,10 +2078,14 @@ class RgcLgnV1Network:
 
         # Combine ON/OFF RGC spikes
         rgc = np.concatenate([on_spk.ravel(), off_spk.ravel()]).astype(np.float32)
+        rgc_lgn = self.W_rgc_lgn @ rgc
+        if self._lgn_rgc_alpha > 0.0:
+            self._lgn_rgc_drive += self._lgn_rgc_alpha * (rgc_lgn - self._lgn_rgc_drive)
+            rgc_lgn = self._lgn_rgc_drive
 
         # --- LGN layer ---
         self.I_lgn *= self.decay_ampa
-        self.I_lgn += p.w_rgc_lgn * rgc
+        self.I_lgn += p.w_rgc_lgn * rgc_lgn
         lgn_spk = self.lgn.step(self.I_lgn)
         self.last_lgn_spk = lgn_spk
 
@@ -1347,15 +2115,27 @@ class RgcLgnV1Network:
         # --- V1 excitatory layer (integrate excitatory synaptic conductance) ---
         self.g_v1_exc *= self.decay_ampa
         self.g_v1_exc += p.w_exc_gain * I_ff
+        self.g_v1_apical *= self.decay_apical
+        # In laminar mode, apical/feedback drive targets L2/3 (handled below).
+        if (apical_drive is not None) and (self.v1_l23 is None):
+            ap = np.asarray(apical_drive, dtype=np.float32)
+            if ap.ndim == 0:
+                self.g_v1_apical += p.w_exc_gain * float(ap)
+            else:
+                if ap.shape != (self.M,):
+                    raise ValueError(f"apical_drive must have shape (M,), got {tuple(ap.shape)}")
+                self.g_v1_apical += p.w_exc_gain * ap
 
         # Inhibitory conductances (GABA decay)
         self.g_v1_inh_pv_rise *= self.decay_gaba_rise_pv
         self.g_v1_inh_pv_decay *= self.decay_gaba
         self.g_v1_inh_som *= self.decay_gaba
         self.g_v1_inh_pp *= self.decay_gaba
+        self.g_l23_inh_som *= self.decay_gaba
 
         # --- PV interneurons (feedforward inhibition; must run BEFORE E to be feedforward-in-time) ---
         self.I_pv *= self.decay_ampa
+        self.I_pv_inh *= self.decay_gaba
         # Thalamocortical drive to PV (feedforward inhibition)
         idx_pv = (self.ptr - self.D_pv) % self.L
         arrivals_pv = self.delay_buf[idx_pv, self.lgn_ids].astype(np.float32)  # (n_pv, n_lgn)
@@ -1375,8 +2155,12 @@ class RgcLgnV1Network:
 
         # Local recurrent drive from E to PV (feedback component, delayed by one step)
         self.I_pv += self.W_e_pv @ self.prev_v1_spk.astype(np.float32)
-        pv_spk = self.pv.step(self.I_pv)
+        pv_spk = self.pv.step(self.I_pv - self.I_pv_inh)
         self.last_pv_spk = pv_spk
+
+        # PV->PV mutual inhibition (affects next step).
+        if self.W_pv_pv is not None:
+            self.I_pv_inh += self.W_pv_pv @ pv_spk.astype(np.float32)
 
         # PV->E inhibition (GABA conductance increment with rise time)
         g_pv_inc = self.W_pv_e @ pv_spk.astype(np.float32)
@@ -1411,20 +2195,74 @@ class RgcLgnV1Network:
         # Total current to V1 excitatory (conductance-based inhibition)
         g_pv = np.clip(self.g_v1_inh_pv_decay - self.g_v1_inh_pv_rise, 0.0, None)
         g_inh = g_pv + self.g_v1_inh_som + self.g_v1_inh_pp
-        I_exc = self.g_v1_exc * (p.E_exc - self.v1_exc.v)
+        I_exc_basal = self.g_v1_exc * (p.E_exc - self.v1_exc.v)
+        if (float(p.apical_gain) > 0.0) and (self.v1_l23 is None):
+            x = (self.g_v1_apical - float(p.apical_threshold)) / max(1e-6, float(p.apical_slope))
+            gate = 1.0 + float(p.apical_gain) * (1.0 / (1.0 + np.exp(-x)))
+            I_exc = I_exc_basal * gate.astype(np.float32, copy=False)
+        else:
+            I_exc = I_exc_basal
         I_v1_total = I_exc + g_inh * (p.E_inh - self.v1_exc.v)
         I_v1_total = I_v1_total + self.I_v1_bias
         v1_spk = self.v1_exc.step(I_v1_total)
         self.last_v1_spk = v1_spk
 
+        # --- Optional L2/3 excitatory layer (receives basal L4 drive + apical modulation) ---
+        v1_l23_spk = np.zeros(self.M, dtype=np.uint8)
+        if self.v1_l23 is not None:
+            self.g_l23_exc *= self.decay_ampa
+            if self.W_l4_l23 is not None:
+                self.g_l23_exc += p.w_exc_gain * (self.W_l4_l23 @ v1_spk.astype(np.float32))
+
+            self.g_l23_apical *= self.decay_apical
+            if apical_drive is not None:
+                ap = np.asarray(apical_drive, dtype=np.float32)
+                if ap.ndim == 0:
+                    self.g_l23_apical += p.w_exc_gain * float(ap)
+                else:
+                    if ap.shape != (self.M,):
+                        raise ValueError(f"apical_drive must have shape (M,), got {tuple(ap.shape)}")
+                    self.g_l23_apical += p.w_exc_gain * ap
+
+            I_l23_exc_basal = self.g_l23_exc * (p.E_exc - self.v1_l23.v)
+            if float(p.apical_gain) > 0.0:
+                x = (self.g_l23_apical - float(p.apical_threshold)) / max(1e-6, float(p.apical_slope))
+                gate = 1.0 + float(p.apical_gain) * (1.0 / (1.0 + np.exp(-x)))
+                I_l23_exc = I_l23_exc_basal * gate.astype(np.float32, copy=False)
+            else:
+                I_l23_exc = I_l23_exc_basal
+
+            I_l23_total = I_l23_exc + self.g_l23_inh_som * (p.E_inh - self.v1_l23.v) + self.I_l23_bias
+            v1_l23_spk = self.v1_l23.step(I_l23_total)
+        self.last_v1_l23_spk = v1_l23_spk
+
+        # --- VIP interneurons (disinhibitory; updated AFTER E, affects next step) ---
+        vip_spk = np.zeros(self.n_vip, dtype=np.uint8)
+        if self.vip is not None:
+            self.I_vip *= self.decay_ampa
+            if self.W_e_vip.size:
+                drive_spk = self.prev_v1_l23_spk if (self.v1_l23 is not None) else self.prev_v1_spk
+                self.I_vip += self.W_e_vip @ drive_spk.astype(np.float32)
+            self.I_vip += float(p.vip_bias_current) + float(vip_td)
+            vip_spk = self.vip.step(self.I_vip)
+        self.last_vip_spk = vip_spk
+
         # --- SOM interneurons (lateral / dendritic inhibition; updated AFTER E, affects next step) ---
         self.I_som *= self.decay_ampa
-        self.I_som += self.W_e_som @ v1_spk.astype(np.float32)
-        som_spk = self.som.step(self.I_som)
+        self.I_som_inh *= self.decay_gaba
+        som_drive = v1_l23_spk if (self.v1_l23 is not None) else v1_spk
+        self.I_som += self.W_e_som @ som_drive.astype(np.float32)
+        if (self.vip is not None) and (self.W_vip_som.size) and (float(p.w_vip_som) != 0.0):
+            self.I_som_inh += self.W_vip_som @ vip_spk.astype(np.float32)
+        som_spk = self.som.step(self.I_som - self.I_som_inh)
         self.last_som_spk = som_spk
 
-        # SOM->E lateral inhibition (GABA conductance increment; affects next step)
-        self.g_v1_inh_som += self.W_som_e @ som_spk.astype(np.float32)
+        # SOM->E lateral inhibition (GABA conductance increment; affects next step).
+        # In laminar mode, SOM targets L2/3; L4 remains purely feedforward/local-inhibition.
+        if self.v1_l23 is not None:
+            self.g_l23_inh_som += self.W_som_e @ som_spk.astype(np.float32)
+        else:
+            self.g_v1_inh_som += self.W_som_e @ som_spk.astype(np.float32)
 
         # --- Lateral excitation (recurrent; applied after E, affects next step) ---
         self.g_v1_exc += p.w_exc_gain * (self.W_e_e @ v1_spk.astype(np.float32))
@@ -1480,6 +2318,7 @@ class RgcLgnV1Network:
         # Update delay buffer pointer
         self.ptr = (self.ptr + 1) % self.L
         self.prev_v1_spk = v1_spk
+        self.prev_v1_l23_spk = v1_l23_spk
 
         return v1_spk
 
@@ -1495,12 +2334,43 @@ class RgcLgnV1Network:
         # Structural sparsity mask must remain enforced under slow scaling.
         self.W *= self.tc_mask_e_f32
 
+    def apply_split_constraint(self) -> None:
+        """Apply an ON/OFF split-constraint scaling to LGN->E weights (local per neuron)."""
+        p = self.p
+        if p.split_constraint_rate <= 0.0:
+            return
+        n_pix = int(p.N) * int(p.N)
+
+        sum_on = self.W[:, :n_pix].sum(axis=1).astype(np.float32, copy=False)
+        sum_off = self.W[:, n_pix:].sum(axis=1).astype(np.float32, copy=False)
+
+        tgt_on = self.split_target_on.astype(np.float32, copy=False)
+        tgt_off = self.split_target_off.astype(np.float32, copy=False)
+        err_on = (tgt_on - sum_on) / (tgt_on + 1e-12)
+        err_off = (tgt_off - sum_off) / (tgt_off + 1e-12)
+
+        scale_on = 1.0 + p.split_constraint_rate * err_on
+        scale_off = 1.0 + p.split_constraint_rate * err_off
+        lo = 1.0 - float(p.split_constraint_clip)
+        hi = 1.0 + float(p.split_constraint_clip)
+        scale_on = np.clip(scale_on, lo, hi).astype(np.float32, copy=False)
+        scale_off = np.clip(scale_off, lo, hi).astype(np.float32, copy=False)
+
+        self.W[:, :n_pix] *= scale_on[:, None]
+        self.W[:, n_pix:] *= scale_off[:, None]
+
+        np.clip(self.W, 0.0, p.w_max, out=self.W)
+        np.minimum(self.W, p.w_max * self.lgn_mask_e, out=self.W)
+        self.W *= self.tc_mask_e_f32
+
     def _segment_boundary_updates(self, v1_counts: np.ndarray) -> None:
         """Update slow plasticity/homeostasis terms at a segment boundary (local, per-neuron)."""
         p = self.p
 
         # Optional slow synaptic scaling (no hard normalization).
         self.apply_homeostasis()
+        # Optional ON/OFF split constraint (local resource pools; no global normalization).
+        self.apply_split_constraint()
 
         # Intrinsic homeostasis (bias current) to keep firing near target.
         seg_rate_hz = v1_counts.astype(np.float32) / (p.segment_ms / 1000.0)
@@ -1542,27 +2412,44 @@ class RgcLgnV1Network:
             if (k % frame_steps) == 0:
                 if use_pad:
                     n = int(self._X_pad.shape[0])
-                    stim_pad = np.zeros((n, n), dtype=np.float32)
-                    density = float(p.spots_density)
-                    if density > 0:
-                        n_spots = int(round(density * float(n * n)))
-                        n_spots = int(max(1, min(n * n, n_spots)))
-                        idx = self.rng.choice(n * n, size=n_spots, replace=False)
-                        pol = self.rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=n_spots, replace=True)
-                        stim_pad.ravel()[idx] = pol * float(p.spots_amp)
+                    X = self._X_pad
+                    Y = self._Y_pad
                 else:
-                    stim = np.zeros((p.N, p.N), dtype=np.float32)
-                    density = float(p.spots_density)
-                    if density > 0:
-                        n_spots = int(round(density * float(p.N * p.N)))
-                        n_spots = int(max(1, min(p.N * p.N, n_spots)))
-                        idx = self.rng.choice(p.N * p.N, size=n_spots, replace=False)
-                        pol = self.rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=n_spots, replace=True)
-                        stim.ravel()[idx] = pol * float(p.spots_amp)
+                    n = int(p.N)
+                    X = self.X
+                    Y = self.Y
+
+                stim_frame = np.zeros((n, n), dtype=np.float32)
+                density = float(p.spots_density)
+                if density > 0:
+                    n_spots = int(round(density * float(n * n)))
+                    n_spots = int(max(1, min(n * n, n_spots)))
+                    idx = self.rng.choice(n * n, size=n_spots, replace=False)
+                    pol = self.rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=n_spots, replace=True)
+
+                    sigma = float(p.spots_sigma)
+                    if sigma <= 0:
+                        stim_frame.ravel()[idx] = pol * float(p.spots_amp)
+                    else:
+                        cx = X.ravel()[idx].astype(np.float32, copy=False)
+                        cy = Y.ravel()[idx].astype(np.float32, copy=False)
+                        # Subpixel jitter keeps flashes from locking to the sampling lattice.
+                        cx = (cx + self.rng.uniform(-0.5, 0.5, size=cx.shape).astype(np.float32))
+                        cy = (cy + self.rng.uniform(-0.5, 0.5, size=cy.shape).astype(np.float32))
+                        inv2s2 = float(1.0 / (2.0 * sigma * sigma))
+                        for j in range(n_spots):
+                            stim_frame += (pol[j] * float(p.spots_amp)) * np.exp(
+                                -(((X - cx[j]) ** 2 + (Y - cy[j]) ** 2) * inv2s2)
+                            ).astype(np.float32)
+
+                if use_pad:
+                    stim_pad = stim_frame
+                else:
+                    stim = stim_frame
 
             if use_pad:
-                drive = self._rgc_drive_from_pad_stimulus(stim_pad, contrast=contrast)
-                on_spk, off_spk = self.rgc_spikes_from_drive(drive)
+                drive_on, drive_off = self._rgc_drives_from_pad_stimulus(stim_pad, contrast=contrast)
+                on_spk, off_spk = self.rgc_spikes_from_drives(drive_on, drive_off)
             else:
                 on_spk, off_spk = self.rgc_spikes(stim, contrast=contrast)
 
@@ -1600,8 +2487,8 @@ class RgcLgnV1Network:
                         np.clip(stim, -float(p.noise_clip), float(p.noise_clip), out=stim)
 
             if use_pad:
-                drive = self._rgc_drive_from_pad_stimulus(stim_pad, contrast=contrast)
-                on_spk, off_spk = self.rgc_spikes_from_drive(drive)
+                drive_on, drive_off = self._rgc_drives_from_pad_stimulus(stim_pad, contrast=contrast)
+                on_spk, off_spk = self.rgc_spikes_from_drives(drive_on, drive_off)
             else:
                 on_spk, off_spk = self.rgc_spikes(stim, contrast=contrast)
 
@@ -1612,6 +2499,152 @@ class RgcLgnV1Network:
 
         return v1_counts
 
+    def run_segment_sparse_spots_counts(self, plastic: bool, *, contrast: float = 1.0) -> dict:
+        """Run one sparse_spots segment and return spike counts for E/PV/PP/SOM/LGN (diagnostics/tests)."""
+        p = self.p
+        steps = int(p.segment_ms / p.dt_ms)
+        frame_steps = max(1, int(round(float(p.spots_frame_ms) / float(p.dt_ms))))
+
+        v1_counts = np.zeros(self.M, dtype=np.int32)
+        l23_counts = np.zeros(self.M, dtype=np.int32)
+        pv_counts = np.zeros(self.n_pv, dtype=np.int32)
+        pp_counts = np.zeros(self.n_pp, dtype=np.int32)
+        som_counts = np.zeros(self.n_som, dtype=np.int32)
+        vip_counts = np.zeros(self.n_vip, dtype=np.int32)
+        lgn_counts = np.zeros(self.n_lgn, dtype=np.int32)
+
+        impl = str(p.rgc_dog_impl).lower()
+        use_pad = p.rgc_center_surround and (impl == "padded_fft")
+        if use_pad and (self._X_pad is None or self._Y_pad is None):
+            raise RuntimeError("padded_fft DoG front-end not initialized")
+
+        stim_pad = None
+        stim = None
+        for k in range(steps):
+            if (k % frame_steps) == 0:
+                if use_pad:
+                    n = int(self._X_pad.shape[0])
+                    X = self._X_pad
+                    Y = self._Y_pad
+                else:
+                    n = int(p.N)
+                    X = self.X
+                    Y = self.Y
+
+                stim_frame = np.zeros((n, n), dtype=np.float32)
+                density = float(p.spots_density)
+                if density > 0:
+                    n_spots = int(round(density * float(n * n)))
+                    n_spots = int(max(1, min(n * n, n_spots)))
+                    idx = self.rng.choice(n * n, size=n_spots, replace=False)
+                    pol = self.rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=n_spots, replace=True)
+
+                    sigma = float(p.spots_sigma)
+                    if sigma <= 0:
+                        stim_frame.ravel()[idx] = pol * float(p.spots_amp)
+                    else:
+                        cx = X.ravel()[idx].astype(np.float32, copy=False)
+                        cy = Y.ravel()[idx].astype(np.float32, copy=False)
+                        cx = (cx + self.rng.uniform(-0.5, 0.5, size=cx.shape).astype(np.float32))
+                        cy = (cy + self.rng.uniform(-0.5, 0.5, size=cy.shape).astype(np.float32))
+                        inv2s2 = float(1.0 / (2.0 * sigma * sigma))
+                        for j in range(n_spots):
+                            stim_frame += (pol[j] * float(p.spots_amp)) * np.exp(
+                                -(((X - cx[j]) ** 2 + (Y - cy[j]) ** 2) * inv2s2)
+                            ).astype(np.float32)
+
+                if use_pad:
+                    stim_pad = stim_frame
+                else:
+                    stim = stim_frame
+
+            if use_pad:
+                drive_on, drive_off = self._rgc_drives_from_pad_stimulus(stim_pad, contrast=contrast)
+                on_spk, off_spk = self.rgc_spikes_from_drives(drive_on, drive_off)
+            else:
+                on_spk, off_spk = self.rgc_spikes(stim, contrast=contrast)
+
+            v1_counts += self.step(on_spk, off_spk, plastic=plastic)
+            l23_counts += self.last_v1_l23_spk
+            pv_counts += self.last_pv_spk
+            pp_counts += self.last_pp_spk
+            som_counts += self.last_som_spk
+            vip_counts += self.last_vip_spk
+            lgn_counts += self.last_lgn_spk
+
+        if plastic:
+            self._segment_boundary_updates(v1_counts)
+
+        return {
+            "v1_counts": v1_counts,
+            "l23_counts": l23_counts,
+            "pv_counts": pv_counts,
+            "pp_counts": pp_counts,
+            "som_counts": som_counts,
+            "vip_counts": vip_counts,
+            "lgn_counts": lgn_counts,
+        }
+
+    def run_segment_white_noise_counts(self, plastic: bool, *, contrast: float = 1.0) -> dict:
+        """Run one white_noise segment and return spike counts for E/PV/PP/SOM/LGN (diagnostics/tests)."""
+        p = self.p
+        steps = int(p.segment_ms / p.dt_ms)
+        frame_steps = max(1, int(round(float(p.noise_frame_ms) / float(p.dt_ms))))
+
+        v1_counts = np.zeros(self.M, dtype=np.int32)
+        l23_counts = np.zeros(self.M, dtype=np.int32)
+        pv_counts = np.zeros(self.n_pv, dtype=np.int32)
+        pp_counts = np.zeros(self.n_pp, dtype=np.int32)
+        som_counts = np.zeros(self.n_som, dtype=np.int32)
+        vip_counts = np.zeros(self.n_vip, dtype=np.int32)
+        lgn_counts = np.zeros(self.n_lgn, dtype=np.int32)
+
+        impl = str(p.rgc_dog_impl).lower()
+        use_pad = p.rgc_center_surround and (impl == "padded_fft")
+        if use_pad and (self._X_pad is None or self._Y_pad is None):
+            raise RuntimeError("padded_fft DoG front-end not initialized")
+
+        stim_pad = None
+        stim = None
+        for k in range(steps):
+            if (k % frame_steps) == 0:
+                if use_pad:
+                    n = int(self._X_pad.shape[0])
+                    stim_pad = self.rng.normal(0.0, float(p.noise_sigma), size=(n, n)).astype(np.float32)
+                    if p.noise_clip > 0:
+                        np.clip(stim_pad, -float(p.noise_clip), float(p.noise_clip), out=stim_pad)
+                else:
+                    stim = self.rng.normal(0.0, float(p.noise_sigma), size=(p.N, p.N)).astype(np.float32)
+                    if p.noise_clip > 0:
+                        np.clip(stim, -float(p.noise_clip), float(p.noise_clip), out=stim)
+
+            if use_pad:
+                drive_on, drive_off = self._rgc_drives_from_pad_stimulus(stim_pad, contrast=contrast)
+                on_spk, off_spk = self.rgc_spikes_from_drives(drive_on, drive_off)
+            else:
+                on_spk, off_spk = self.rgc_spikes(stim, contrast=contrast)
+
+            v1_counts += self.step(on_spk, off_spk, plastic=plastic)
+            l23_counts += self.last_v1_l23_spk
+            pv_counts += self.last_pv_spk
+            pp_counts += self.last_pp_spk
+            som_counts += self.last_som_spk
+            vip_counts += self.last_vip_spk
+            lgn_counts += self.last_lgn_spk
+
+        if plastic:
+            self._segment_boundary_updates(v1_counts)
+
+        return {
+            "v1_counts": v1_counts,
+            "l23_counts": l23_counts,
+            "pv_counts": pv_counts,
+            "pp_counts": pp_counts,
+            "som_counts": som_counts,
+            "vip_counts": vip_counts,
+            "lgn_counts": lgn_counts,
+        }
+
     def run_segment_counts(self, theta_deg: float, plastic: bool, *, contrast: float = 1.0) -> dict:
         """Run one segment and return spike counts for E/PV/SOM/LGN (for diagnostics/tests)."""
         p = self.p
@@ -1619,24 +2652,30 @@ class RgcLgnV1Network:
         phase = float(self.rng.uniform(0, 2 * math.pi))
 
         v1_counts = np.zeros(self.M, dtype=np.int32)
+        l23_counts = np.zeros(self.M, dtype=np.int32)
         pv_counts = np.zeros(self.n_pv, dtype=np.int32)
         pp_counts = np.zeros(self.n_pp, dtype=np.int32)
         som_counts = np.zeros(self.n_som, dtype=np.int32)
+        vip_counts = np.zeros(self.n_vip, dtype=np.int32)
         lgn_counts = np.zeros(self.n_lgn, dtype=np.int32)
 
         for k in range(steps):
             on_spk, off_spk = self.rgc_spikes_grating(theta_deg, t_ms=k * p.dt_ms, phase=phase, contrast=contrast)
             v1_counts += self.step(on_spk, off_spk, plastic=plastic)
+            l23_counts += self.last_v1_l23_spk
             pv_counts += self.last_pv_spk
             pp_counts += self.last_pp_spk
             som_counts += self.last_som_spk
+            vip_counts += self.last_vip_spk
             lgn_counts += self.last_lgn_spk
 
         return {
             "v1_counts": v1_counts,
+            "l23_counts": l23_counts,
             "pv_counts": pv_counts,
             "pp_counts": pp_counts,
             "som_counts": som_counts,
+            "vip_counts": vip_counts,
             "lgn_counts": lgn_counts,
         }
 
@@ -1653,6 +2692,11 @@ class RgcLgnV1Network:
         g_pp_inh_ts = np.zeros((steps, self.M), dtype=np.float32)
         v_ts = np.zeros((steps, self.M), dtype=np.float32)
         v1_spk_ts = np.zeros((steps, self.M), dtype=np.uint8)
+        v_l23_ts = None
+        v1_l23_spk_ts = None
+        if self.v1_l23 is not None:
+            v_l23_ts = np.zeros((steps, self.M), dtype=np.float32)
+            v1_l23_spk_ts = np.zeros((steps, self.M), dtype=np.uint8)
 
         for k in range(steps):
             on_spk, off_spk = self.rgc_spikes_grating(theta_deg, t_ms=k * p.dt_ms, phase=phase, contrast=contrast)
@@ -1662,6 +2706,9 @@ class RgcLgnV1Network:
             g_pp_inh_ts[k] = self.g_v1_inh_pp
             v_ts[k] = self.v1_exc.v
             v1_spk_ts[k] = v1_spk
+            if v_l23_ts is not None and v1_l23_spk_ts is not None:
+                v_l23_ts[k] = self.v1_l23.v
+                v1_l23_spk_ts[k] = self.last_v1_l23_spk
 
         t_ms = (np.arange(steps, dtype=np.float32) * p.dt_ms).astype(np.float32)
         return {
@@ -1671,6 +2718,8 @@ class RgcLgnV1Network:
             "g_pp_inh": g_pp_inh_ts,
             "v": v_ts,
             "v1_spk": v1_spk_ts,
+            "v_l23": v_l23_ts,
+            "v1_l23_spk": v1_l23_spk_ts,
         }
 
     def evaluate_tuning(self, thetas_deg: np.ndarray, repeats: int, *, contrast: float = 1.0) -> np.ndarray:
@@ -1688,24 +2737,39 @@ class RgcLgnV1Network:
         saved_lgn_u = self.lgn.u.copy()
         saved_v1_v = self.v1_exc.v.copy()
         saved_v1_u = self.v1_exc.u.copy()
+        saved_l23_v = None if self.v1_l23 is None else self.v1_l23.v.copy()
+        saved_l23_u = None if self.v1_l23 is None else self.v1_l23.u.copy()
         saved_pv_v = self.pv.v.copy()
         saved_pv_u = self.pv.u.copy()
         saved_pp_v = self.pp.v.copy()
         saved_pp_u = self.pp.u.copy()
         saved_som_v = self.som.v.copy()
         saved_som_u = self.som.u.copy()
+        saved_vip_v = None if self.vip is None else self.vip.v.copy()
+        saved_vip_u = None if self.vip is None else self.vip.u.copy()
         saved_I_lgn = self.I_lgn.copy()
+        saved_lgn_rgc_drive = self._lgn_rgc_drive.copy()
         saved_g_v1_exc = self.g_v1_exc.copy()
+        saved_g_v1_apical = self.g_v1_apical.copy()
+        saved_g_l23_exc = self.g_l23_exc.copy()
+        saved_g_l23_apical = self.g_l23_apical.copy()
+        saved_g_l23_inh_som = self.g_l23_inh_som.copy()
+        saved_I_l23_bias = self.I_l23_bias.copy()
         saved_I_v1_bias = self.I_v1_bias.copy()
         saved_g_v1_inh_pv_rise = self.g_v1_inh_pv_rise.copy()
         saved_g_v1_inh_pv_decay = self.g_v1_inh_pv_decay.copy()
         saved_g_v1_inh_som = self.g_v1_inh_som.copy()
         saved_g_v1_inh_pp = self.g_v1_inh_pp.copy()
         saved_I_pv = self.I_pv.copy()
+        saved_I_pv_inh = self.I_pv_inh.copy()
         saved_I_pp = self.I_pp.copy()
         saved_I_som = self.I_som.copy()
+        saved_I_som_inh = self.I_som_inh.copy()
+        saved_I_vip = self.I_vip.copy()
         saved_buf = self.delay_buf.copy()
         saved_ptr = self.ptr
+        saved_tc_stp_x = None if self.tc_stp_x is None else self.tc_stp_x.copy()
+        saved_tc_stp_x_pv = None if self.tc_stp_x_pv is None else self.tc_stp_x_pv.copy()
         saved_stdp_x_pre = self.stdp.x_pre.copy()
         saved_stdp_x_pre_slow = self.stdp.x_pre_slow.copy()
         saved_stdp_x_post = self.stdp.x_post.copy()
@@ -1714,6 +2778,13 @@ class RgcLgnV1Network:
         saved_ee_x_pre = self.ee_stdp.x_pre.copy()
         saved_ee_x_post = self.ee_stdp.x_post.copy()
         saved_prev_v1_spk = self.prev_v1_spk.copy()
+        saved_prev_v1_l23_spk = self.prev_v1_l23_spk.copy()
+        saved_rgc_drive_fast_on = None if self._rgc_drive_fast_on is None else self._rgc_drive_fast_on.copy()
+        saved_rgc_drive_slow_on = None if self._rgc_drive_slow_on is None else self._rgc_drive_slow_on.copy()
+        saved_rgc_drive_fast_off = None if self._rgc_drive_fast_off is None else self._rgc_drive_fast_off.copy()
+        saved_rgc_drive_slow_off = None if self._rgc_drive_slow_off is None else self._rgc_drive_slow_off.copy()
+        saved_rgc_refr_on = None if self._rgc_refr_on is None else self._rgc_refr_on.copy()
+        saved_rgc_refr_off = None if self._rgc_refr_off is None else self._rgc_refr_off.copy()
 
         for j, th in enumerate(thetas_deg):
             cnt = np.zeros(self.M, dtype=np.float32)
@@ -1727,24 +2798,44 @@ class RgcLgnV1Network:
         self.lgn.u = saved_lgn_u
         self.v1_exc.v = saved_v1_v
         self.v1_exc.u = saved_v1_u
+        if (self.v1_l23 is not None) and (saved_l23_v is not None) and (saved_l23_u is not None):
+            self.v1_l23.v = saved_l23_v
+            self.v1_l23.u = saved_l23_u
         self.pv.v = saved_pv_v
         self.pv.u = saved_pv_u
         self.pp.v = saved_pp_v
         self.pp.u = saved_pp_u
         self.som.v = saved_som_v
         self.som.u = saved_som_u
+        if (self.vip is not None) and (saved_vip_v is not None) and (saved_vip_u is not None):
+            self.vip.v = saved_vip_v
+            self.vip.u = saved_vip_u
         self.I_lgn = saved_I_lgn
+        self._lgn_rgc_drive = saved_lgn_rgc_drive
         self.g_v1_exc = saved_g_v1_exc
+        self.g_v1_apical = saved_g_v1_apical
+        self.g_l23_exc = saved_g_l23_exc
+        self.g_l23_apical = saved_g_l23_apical
+        self.g_l23_inh_som = saved_g_l23_inh_som
+        self.I_l23_bias = saved_I_l23_bias
         self.I_v1_bias = saved_I_v1_bias
         self.g_v1_inh_pv_rise = saved_g_v1_inh_pv_rise
         self.g_v1_inh_pv_decay = saved_g_v1_inh_pv_decay
         self.g_v1_inh_som = saved_g_v1_inh_som
         self.g_v1_inh_pp = saved_g_v1_inh_pp
         self.I_pv = saved_I_pv
+        self.I_pv_inh = saved_I_pv_inh
         self.I_pp = saved_I_pp
         self.I_som = saved_I_som
+        self.I_som_inh = saved_I_som_inh
+        if self.I_vip.size:
+            self.I_vip = saved_I_vip
         self.delay_buf = saved_buf
         self.ptr = saved_ptr
+        if (self.tc_stp_x is not None) and (saved_tc_stp_x is not None):
+            self.tc_stp_x[...] = saved_tc_stp_x
+        if (self.tc_stp_x_pv is not None) and (saved_tc_stp_x_pv is not None):
+            self.tc_stp_x_pv[...] = saved_tc_stp_x_pv
         self.stdp.x_pre = saved_stdp_x_pre
         self.stdp.x_pre_slow = saved_stdp_x_pre_slow
         self.stdp.x_post = saved_stdp_x_post
@@ -1753,6 +2844,37 @@ class RgcLgnV1Network:
         self.ee_stdp.x_pre = saved_ee_x_pre
         self.ee_stdp.x_post = saved_ee_x_post
         self.prev_v1_spk = saved_prev_v1_spk
+        self.prev_v1_l23_spk = saved_prev_v1_l23_spk
+        if saved_rgc_drive_fast_on is not None:
+            if self._rgc_drive_fast_on is None:
+                self._rgc_drive_fast_on = saved_rgc_drive_fast_on
+            else:
+                self._rgc_drive_fast_on[...] = saved_rgc_drive_fast_on
+        if saved_rgc_drive_slow_on is not None:
+            if self._rgc_drive_slow_on is None:
+                self._rgc_drive_slow_on = saved_rgc_drive_slow_on
+            else:
+                self._rgc_drive_slow_on[...] = saved_rgc_drive_slow_on
+        if saved_rgc_drive_fast_off is not None:
+            if self._rgc_drive_fast_off is None:
+                self._rgc_drive_fast_off = saved_rgc_drive_fast_off
+            else:
+                self._rgc_drive_fast_off[...] = saved_rgc_drive_fast_off
+        if saved_rgc_drive_slow_off is not None:
+            if self._rgc_drive_slow_off is None:
+                self._rgc_drive_slow_off = saved_rgc_drive_slow_off
+            else:
+                self._rgc_drive_slow_off[...] = saved_rgc_drive_slow_off
+        if saved_rgc_refr_on is not None:
+            if self._rgc_refr_on is None:
+                self._rgc_refr_on = saved_rgc_refr_on
+            else:
+                self._rgc_refr_on[...] = saved_rgc_refr_on
+        if saved_rgc_refr_off is not None:
+            if self._rgc_refr_off is None:
+                self._rgc_refr_off = saved_rgc_refr_off
+            else:
+                self._rgc_refr_off[...] = saved_rgc_refr_off
         self.rng.bit_generator.state = rng_state
 
         return rates
@@ -1762,12 +2884,24 @@ class RgcLgnV1Network:
 # Visualization functions
 # =============================================================================
 
-def plot_weight_maps(W: np.ndarray, N: int, outpath: str, title: str) -> None:
+def plot_weight_maps(W: np.ndarray, N: int, outpath: str, title: str, *, smooth_sigma: float = 0.0) -> None:
     """Plot ON, OFF, and ON-OFF weight maps for each ensemble."""
     M = W.shape[0]
     W_on = W[:, :N * N].reshape(M, N, N)
     W_off = W[:, N * N:].reshape(M, N, N)
     W_diff = W_on - W_off
+
+    sigma = float(smooth_sigma)
+    if sigma > 0.0:
+        for m in range(M):
+            if gaussian_filter is None:
+                W_on[m] = _gaussian_filter_fallback(W_on[m], sigma=sigma)
+                W_off[m] = _gaussian_filter_fallback(W_off[m], sigma=sigma)
+                W_diff[m] = _gaussian_filter_fallback(W_diff[m], sigma=sigma)
+            else:
+                W_on[m] = gaussian_filter(W_on[m], sigma=sigma, mode="nearest")
+                W_off[m] = gaussian_filter(W_off[m], sigma=sigma, mode="nearest")
+                W_diff[m] = gaussian_filter(W_diff[m], sigma=sigma, mode="nearest")
 
     fig, axes = plt.subplots(M, 3, figsize=(9, 2.1 * M))
     if M == 1:
@@ -1778,6 +2912,72 @@ def plot_weight_maps(W: np.ndarray, N: int, outpath: str, title: str) -> None:
                                               (W_diff[m], "ON-OFF")]):
             ax = axes[m, j]
             im = ax.imshow(arr, interpolation="nearest")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if m == 0:
+                ax.set_title(coltitle)
+            if j == 0:
+                ax.set_ylabel(f"E{m}")
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=150)
+    plt.close(fig)
+
+
+def plot_weight_maps_before_after(W_before: np.ndarray, W_after: np.ndarray, N: int,
+                                  outpath: str, title: str, *, smooth_sigma: float = 0.0) -> None:
+    """Plot initial vs final ON/OFF/ON-OFF weights with matched color scales."""
+    M = int(W_before.shape[0])
+    n_pix = int(N) * int(N)
+
+    b_on = W_before[:, :n_pix].reshape(M, N, N).astype(np.float32, copy=True)
+    b_off = W_before[:, n_pix:].reshape(M, N, N).astype(np.float32, copy=True)
+    b_diff = b_on - b_off
+
+    a_on = W_after[:, :n_pix].reshape(M, N, N).astype(np.float32, copy=True)
+    a_off = W_after[:, n_pix:].reshape(M, N, N).astype(np.float32, copy=True)
+    a_diff = a_on - a_off
+
+    sigma = float(smooth_sigma)
+    if sigma > 0.0:
+        for m in range(M):
+            if gaussian_filter is None:
+                b_on[m] = _gaussian_filter_fallback(b_on[m], sigma=sigma)
+                b_off[m] = _gaussian_filter_fallback(b_off[m], sigma=sigma)
+                b_diff[m] = _gaussian_filter_fallback(b_diff[m], sigma=sigma)
+                a_on[m] = _gaussian_filter_fallback(a_on[m], sigma=sigma)
+                a_off[m] = _gaussian_filter_fallback(a_off[m], sigma=sigma)
+                a_diff[m] = _gaussian_filter_fallback(a_diff[m], sigma=sigma)
+            else:
+                b_on[m] = gaussian_filter(b_on[m], sigma=sigma, mode="nearest")
+                b_off[m] = gaussian_filter(b_off[m], sigma=sigma, mode="nearest")
+                b_diff[m] = gaussian_filter(b_diff[m], sigma=sigma, mode="nearest")
+                a_on[m] = gaussian_filter(a_on[m], sigma=sigma, mode="nearest")
+                a_off[m] = gaussian_filter(a_off[m], sigma=sigma, mode="nearest")
+                a_diff[m] = gaussian_filter(a_diff[m], sigma=sigma, mode="nearest")
+
+    vmax_on = float(max(np.abs(b_on).max(), np.abs(a_on).max(), 1e-9))
+    vmax_off = float(max(np.abs(b_off).max(), np.abs(a_off).max(), 1e-9))
+    vmax_diff = float(max(np.abs(b_diff).max(), np.abs(a_diff).max(), 1e-9))
+
+    fig, axes = plt.subplots(M, 6, figsize=(16, 2.0 * M))
+    if M == 1:
+        axes = np.array([axes])
+
+    colspec = [
+        ("Init ON", b_on, -vmax_on, vmax_on),
+        ("Init OFF", b_off, -vmax_off, vmax_off),
+        ("Init ON-OFF", b_diff, -vmax_diff, vmax_diff),
+        ("Final ON", a_on, -vmax_on, vmax_on),
+        ("Final OFF", a_off, -vmax_off, vmax_off),
+        ("Final ON-OFF", a_diff, -vmax_diff, vmax_diff),
+    ]
+    for m in range(M):
+        for j, (coltitle, arrs, vmin, vmax) in enumerate(colspec):
+            ax = axes[m, j]
+            im = ax.imshow(arrs[m], interpolation="nearest", vmin=vmin, vmax=vmax, cmap="viridis")
             ax.set_xticks([])
             ax.set_yticks([])
             if m == 0:
@@ -1855,12 +3055,40 @@ def plot_pref_hist(pref_deg: np.ndarray, osi: np.ndarray, outpath: str,
 def save_eval_npz(outpath: str, *, thetas_deg: np.ndarray, rates_hz: np.ndarray,
                   osi: np.ndarray, pref_deg: np.ndarray, net: "RgcLgnV1Network") -> None:
     """Save numeric evaluation artifacts (no plotting) for reproducibility/debugging."""
+    on_to_off = getattr(net, "on_to_off", None)
+    proj_kwargs: dict = {}
+    if bool(getattr(net.p, "rgc_separate_onoff_mosaics", False)):
+        proj_kwargs = dict(
+            X_on=net.X_on,
+            Y_on=net.Y_on,
+            X_off=net.X_off,
+            Y_off=net.Y_off,
+            sigma=float(getattr(net.p, "rgc_center_sigma", 0.5)),
+        )
+
+    rf_ori, rf_pref = rf_fft_orientation_metrics(net.W, net.N, on_to_off=on_to_off, **proj_kwargs)
+    rf_grating_amp = rf_grating_match_tuning(
+        net.W,
+        net.N,
+        float(net.p.spatial_freq),
+        thetas_deg,
+        on_to_off=on_to_off,
+        **proj_kwargs,
+    )
+    rf_grating_osi, rf_grating_pref = compute_osi(rf_grating_amp, thetas_deg)
+    w_onoff_corr = onoff_weight_corr(net.W, net.N, on_to_off=on_to_off, **proj_kwargs).astype(np.float32)
     np.savez_compressed(
         outpath,
         thetas_deg=thetas_deg.astype(np.float32),
         rates_hz=rates_hz.astype(np.float32),
         osi=osi.astype(np.float32),
         pref_deg=pref_deg.astype(np.float32),
+        rf_orientedness=rf_ori.astype(np.float32),
+        rf_pref_deg=rf_pref.astype(np.float32),
+        rf_grating_amp=rf_grating_amp.astype(np.float32),
+        rf_grating_osi=rf_grating_osi.astype(np.float32),
+        rf_grating_pref_deg=rf_grating_pref.astype(np.float32),
+        w_onoff_corr=w_onoff_corr.astype(np.float32),
         W=net.W.astype(np.float32),
         W_pp=net.W_pp.astype(np.float32),
         W_e_e=net.W_e_e.astype(np.float32),
@@ -2010,6 +3238,79 @@ def run_self_tests(out_dir: str) -> None:
         raise AssertionError(f"SOM geometry test failed: in_var={in_var:.3f} not > out_var={out_var:.3f}")
     report.append(f"Test 5 (SOM geometry): in_var={in_var:.3f}, out_var={out_var:.3f}")
 
+    # --- Test 6a: PV connectivity spread (optional realism) ---
+    p_pv = Params(N=8, M=9, seed=1, pv_in_sigma=1.0, pv_out_sigma=1.0)
+    net_pv = RgcLgnV1Network(p_pv)
+    frac_max_in = float((net_pv.W_pv_e.max(axis=1) / (net_pv.W_pv_e.sum(axis=1) + 1e-12)).max())
+    frac_max_out = float((net_pv.W_e_pv.max(axis=1) / (net_pv.W_e_pv.sum(axis=1) + 1e-12)).max())
+    if frac_max_in > 0.95 or frac_max_out > 0.95:
+        raise AssertionError(
+            f"PV spread test failed: max frac weight too concentrated (in={frac_max_in:.3f}, out={frac_max_out:.3f})"
+        )
+    report.append(f"Test 6a (PV spread): max frac(in)={frac_max_in:.3f}, max frac(out)={frac_max_out:.3f}")
+
+    # --- Test 6b: PV<->PV coupling matrix well-formed ---
+    p_pvpv = Params(N=8, M=9, seed=1, pv_pv_sigma=1.0, w_pv_pv=1.0)
+    net_pvpv = RgcLgnV1Network(p_pvpv)
+    if net_pvpv.W_pv_pv is None:
+        raise AssertionError("PV↔PV coupling test failed: W_pv_pv is None when enabled")
+    if float(np.abs(np.diag(net_pvpv.W_pv_pv)).max()) > 1e-12:
+        raise AssertionError("PV↔PV coupling test failed: diagonal not zero")
+    report.append("Test 6b (PV↔PV coupling): W_pv_pv present, diag=0")
+
+    # --- Test 6c: VIP disinhibition suppresses SOM spiking (smoke test) ---
+    p_no_vip = Params(N=8, M=4, seed=1, segment_ms=120)
+    net_no_vip = RgcLgnV1Network(p_no_vip)
+    c0 = net_no_vip.run_segment_counts(90.0, plastic=False, contrast=2.0)
+    p_vip = Params(
+        N=8,
+        M=4,
+        seed=1,
+        segment_ms=120,
+        n_vip_per_ensemble=1,
+        w_vip_som=25.0,
+        vip_bias_current=30.0,
+    )
+    net_vip = RgcLgnV1Network(p_vip)
+    c1 = net_vip.run_segment_counts(90.0, plastic=False, contrast=2.0)
+    if int(c1["vip_counts"].sum()) <= 0:
+        raise AssertionError("VIP disinhibition test failed: VIP produced 0 spikes")
+    if int(c1["som_counts"].sum()) >= int(c0["som_counts"].sum()):
+        raise AssertionError(
+            "VIP disinhibition test failed: SOM not suppressed "
+            f"(no_vip={int(c0['som_counts'].sum())}, vip={int(c1['som_counts'].sum())})"
+        )
+    report.append(
+        f"Test 6c (VIP disinhibition): SOM spikes {int(c0['som_counts'].sum())} -> {int(c1['som_counts'].sum())}, "
+        f"VIP spikes={int(c1['vip_counts'].sum())}"
+    )
+
+    # --- Test 6d: Apical scaffold is inert when gain=0 and boosts when enabled ---
+    p_ap = Params(N=8, M=1, seed=1, w_pv_e=0.0, w_som_e=0.0, w_pushpull=0.0, w_e_pv=0.0, w_e_som=0.0)
+    net_ap = RgcLgnV1Network(p_ap)
+    on_spk = np.ones((p_ap.N, p_ap.N), dtype=np.uint8)
+    off_spk = np.zeros_like(on_spk)
+    net_ap.reset_state()
+    cnt_a = 0
+    for _ in range(120):
+        cnt_a += int(net_ap.step(on_spk, off_spk, plastic=False, apical_drive=np.array([25.0], dtype=np.float32)).sum())
+    net_ap.reset_state()
+    cnt_b = 0
+    for _ in range(120):
+        cnt_b += int(net_ap.step(on_spk, off_spk, plastic=False).sum())
+    if cnt_a != cnt_b:
+        raise AssertionError(f"Apical inertness test failed: gain=0 but spikes differed ({cnt_a} vs {cnt_b})")
+    net_ap.p.apical_gain = 1.0
+    net_ap.p.apical_threshold = 0.0
+    net_ap.p.apical_slope = 0.1
+    net_ap.reset_state()
+    cnt_c = 0
+    for _ in range(120):
+        cnt_c += int(net_ap.step(on_spk, off_spk, plastic=False, apical_drive=np.array([25.0], dtype=np.float32)).sum())
+    if cnt_c < cnt_b:
+        raise AssertionError(f"Apical gain test failed: enabled apical reduced spikes ({cnt_b} -> {cnt_c})")
+    report.append(f"Test 6d (Apical scaffold): gain=0 spikes={cnt_b}, gain=1 spikes={cnt_c}")
+
     # --- Test 6: Lateral E->E plasticity produces like-to-like coupling ---
     if p.ee_plastic:
         w_change = float(np.mean(np.abs(net.W_e_e - W_e_e0)))
@@ -2133,6 +3434,195 @@ def run_self_tests(out_dir: str) -> None:
         raise AssertionError("Alt-stimulus smoke test failed: negative counts")
     report.append("Test 12 (Alt stimuli smoke): sparse_spots + white_noise ran")
 
+    # --- Test 13: Alternative stimuli actually drive spikes (avoid silent-training regimes) ---
+    p_alt2 = Params(N=8, M=8, seed=1, segment_ms=300, v1_bias_eta=0.0)
+    net_alt2 = RgcLgnV1Network(p_alt2)
+    cnt_noise = net_alt2.run_segment_white_noise_counts(plastic=False, contrast=1.0)
+    if int(cnt_noise["v1_counts"].sum()) <= 0:
+        raise AssertionError(
+            "Alt-stimulus drive test failed (white_noise): V1 produced 0 spikes in one segment "
+            f"(lgn_spikes={int(cnt_noise['lgn_counts'].sum())})"
+        )
+    net_alt2 = RgcLgnV1Network(p_alt2)
+    cnt_spots = net_alt2.run_segment_sparse_spots_counts(plastic=False, contrast=1.0)
+    if int(cnt_spots["v1_counts"].sum()) <= 0:
+        raise AssertionError(
+            "Alt-stimulus drive test failed (sparse_spots): V1 produced 0 spikes in one segment "
+            f"(lgn_spikes={int(cnt_spots['lgn_counts'].sum())})"
+        )
+    report.append(
+        "Test 13 (Alt stimuli drive): "
+        f"white_noise V1={int(cnt_noise['v1_counts'].sum())}, "
+        f"sparse_spots V1={int(cnt_spots['v1_counts'].sum())}"
+    )
+
+    # --- Test 14: White-noise training yields nontrivial OSI when probed with gratings ---
+    p_wn = Params(N=8, M=8, seed=1, segment_ms=300, v1_bias_eta=0.0)
+    net_wn = RgcLgnV1Network(p_wn)
+    for _ in range(120):
+        net_wn.run_segment_white_noise(plastic=True, contrast=1.0)
+    rates_wn = net_wn.evaluate_tuning(thetas, repeats=5, contrast=1.0)
+    osi_wn, _ = compute_osi(rates_wn, thetas)
+    mean_osi_wn = float(osi_wn.mean())
+    if mean_osi_wn < 0.15:
+        raise AssertionError(f"Alt-stimulus OSI test failed (white_noise): mean OSI={mean_osi_wn:.3f} (expected >= 0.15)")
+    if float(rates_wn.mean()) <= 0.05:
+        raise AssertionError(f"Alt-stimulus OSI test failed (white_noise): mean rate={float(rates_wn.mean()):.3f} Hz (too spike-sparse)")
+    report.append(f"Test 14 (White-noise OSI): mean OSI={mean_osi_wn:.3f}, max OSI={float(osi_wn.max()):.3f}, mean rate={float(rates_wn.mean()):.3f} Hz")
+    proj_kwargs_wn: dict = {}
+    if bool(getattr(net_wn.p, "rgc_separate_onoff_mosaics", False)):
+        proj_kwargs_wn = dict(
+            X_on=net_wn.X_on,
+            Y_on=net_wn.Y_on,
+            X_off=net_wn.X_off,
+            Y_off=net_wn.Y_off,
+            sigma=float(getattr(net_wn.p, "rgc_center_sigma", 0.5)),
+        )
+    rf_ori_wn, _ = rf_fft_orientation_metrics(net_wn.W, p_wn.N, on_to_off=net_wn.on_to_off, **proj_kwargs_wn)
+    rf_amp_wn = rf_grating_match_tuning(
+        net_wn.W,
+        p_wn.N,
+        float(p_wn.spatial_freq),
+        thetas,
+        on_to_off=net_wn.on_to_off,
+        **proj_kwargs_wn,
+    )
+    rf_osi_wn, _ = compute_osi(rf_amp_wn, thetas)
+    w_corr_wn = onoff_weight_corr(net_wn.W, p_wn.N, on_to_off=net_wn.on_to_off, **proj_kwargs_wn)
+    if float(rf_osi_wn.mean()) < 0.18:
+        raise AssertionError(
+            f"Alt-stimulus RF test failed (white_noise): weight grating-match mean OSI={float(rf_osi_wn.mean()):.3f} (expected >= 0.18)"
+        )
+    if float(w_corr_wn.mean()) > -0.05:
+        raise AssertionError(
+            f"Alt-stimulus RF test failed (white_noise): ON/OFF weight corr mean={float(w_corr_wn.mean()):+.3f} (expected <= -0.05)"
+        )
+    report.append(
+        f"      (weights) rf_orientedness mean={float(rf_ori_wn.mean()):.3f}, "
+        f"grating-match OSI mean={float(rf_osi_wn.mean()):.3f}, "
+        f"ON/OFF corr mean={float(w_corr_wn.mean()):+.3f}"
+    )
+
+    # --- Test 15: Sparse-spot training yields nontrivial OSI when probed with gratings ---
+    p_ss = Params(N=8, M=8, seed=1, segment_ms=300, v1_bias_eta=0.0)
+    net_ss = RgcLgnV1Network(p_ss)
+    for _ in range(120):
+        net_ss.run_segment_sparse_spots(plastic=True, contrast=1.0)
+    rates_ss = net_ss.evaluate_tuning(thetas, repeats=5, contrast=1.0)
+    osi_ss, _ = compute_osi(rates_ss, thetas)
+    mean_osi_ss = float(osi_ss.mean())
+    if mean_osi_ss < 0.15:
+        raise AssertionError(f"Alt-stimulus OSI test failed (sparse_spots): mean OSI={mean_osi_ss:.3f} (expected >= 0.15)")
+    if float(rates_ss.mean()) <= 0.05:
+        raise AssertionError(f"Alt-stimulus OSI test failed (sparse_spots): mean rate={float(rates_ss.mean()):.3f} Hz (too spike-sparse)")
+    report.append(f"Test 15 (Sparse-spots OSI): mean OSI={mean_osi_ss:.3f}, max OSI={float(osi_ss.max()):.3f}, mean rate={float(rates_ss.mean()):.3f} Hz")
+    proj_kwargs_ss: dict = {}
+    if bool(getattr(net_ss.p, "rgc_separate_onoff_mosaics", False)):
+        proj_kwargs_ss = dict(
+            X_on=net_ss.X_on,
+            Y_on=net_ss.Y_on,
+            X_off=net_ss.X_off,
+            Y_off=net_ss.Y_off,
+            sigma=float(getattr(net_ss.p, "rgc_center_sigma", 0.5)),
+        )
+    rf_ori_ss, _ = rf_fft_orientation_metrics(net_ss.W, p_ss.N, on_to_off=net_ss.on_to_off, **proj_kwargs_ss)
+    rf_amp_ss = rf_grating_match_tuning(
+        net_ss.W,
+        p_ss.N,
+        float(p_ss.spatial_freq),
+        thetas,
+        on_to_off=net_ss.on_to_off,
+        **proj_kwargs_ss,
+    )
+    rf_osi_ss, _ = compute_osi(rf_amp_ss, thetas)
+    w_corr_ss = onoff_weight_corr(net_ss.W, p_ss.N, on_to_off=net_ss.on_to_off, **proj_kwargs_ss)
+    if float(rf_osi_ss.mean()) < 0.20:
+        raise AssertionError(
+            f"Alt-stimulus RF test failed (sparse_spots): weight grating-match mean OSI={float(rf_osi_ss.mean()):.3f} (expected >= 0.20)"
+        )
+    if float(w_corr_ss.mean()) > -0.05:
+        raise AssertionError(
+            f"Alt-stimulus RF test failed (sparse_spots): ON/OFF weight corr mean={float(w_corr_ss.mean()):+.3f} (expected <= -0.05)"
+        )
+    report.append(
+        f"      (weights) rf_orientedness mean={float(rf_ori_ss.mean()):.3f}, "
+        f"grating-match OSI mean={float(rf_osi_ss.mean()):.3f}, "
+        f"ON/OFF corr mean={float(w_corr_ss.mean()):+.3f}"
+    )
+
+    # --- Test 16: Separate ON/OFF mosaics mode (functional + OSI) ---
+    p_mos = Params(
+        N=8,
+        M=4,
+        seed=1,
+        segment_ms=240,
+        v1_bias_eta=0.0,
+        rgc_separate_onoff_mosaics=True,
+    )
+    net_mos = RgcLgnV1Network(p_mos)
+    for _ in range(200):
+        th = float(net_mos.rng.uniform(0.0, 180.0))
+        net_mos.run_segment(th, plastic=True)
+    rates_mos = net_mos.evaluate_tuning(thetas, repeats=3, contrast=1.0)
+    osi_mos, _ = compute_osi(rates_mos, thetas)
+    mean_osi_mos = float(osi_mos.mean())
+    if mean_osi_mos < 0.25:
+        raise AssertionError(
+            f"Separated-mosaic OSI test failed: mean OSI={mean_osi_mos:.3f} (expected >= 0.25)"
+        )
+    ang = getattr(net_mos, "rgc_onoff_offset_angle_deg", None)
+    ang_s = "None" if ang is None else f"{float(ang):.1f}°"
+    report.append(
+        f"Test 16 (ON/OFF mosaics): mean OSI={mean_osi_mos:.3f}, angle={ang_s}"
+    )
+
+    # --- Test 17: Laminar L2/3 scaffold (apical gating affects L2/3 spiking) ---
+    p_lam = Params(
+        N=8,
+        M=1,
+        seed=1,
+        segment_ms=200,
+        v1_bias_eta=0.0,
+        laminar_enabled=True,
+        w_l4_l23=6.0,
+        l4_l23_sigma=0.0,
+        apical_gain=2.0,
+        apical_threshold=0.5,
+        apical_slope=0.1,
+        n_som_per_ensemble=0,
+        n_vip_per_ensemble=0,
+        w_e_som=0.0,
+        w_som_e=0.0,
+        w_e_vip=0.0,
+        w_vip_som=0.0,
+    )
+    net_lam = RgcLgnV1Network(p_lam)
+    if net_lam.v1_l23 is None:
+        raise AssertionError("Laminar scaffold test failed: v1_l23 not initialized")
+
+    steps = int(p_lam.segment_ms / p_lam.dt_ms)
+    theta = 90.0
+    phase = 0.0
+    rng_state = net_lam.rng.bit_generator.state
+
+    def run_l23_spikes(apical: float) -> int:
+        net_lam.reset_state()
+        net_lam.rng.bit_generator.state = rng_state
+        s = 0
+        for k in range(steps):
+            on_spk, off_spk = net_lam.rgc_spikes_grating(theta, t_ms=k * p_lam.dt_ms, phase=phase, contrast=2.0)
+            net_lam.step(on_spk, off_spk, plastic=False, apical_drive=apical)
+            s += int(net_lam.last_v1_l23_spk.sum())
+        return int(s)
+
+    l23_off = run_l23_spikes(0.0)
+    l23_on = run_l23_spikes(100.0)
+    if l23_on <= l23_off:
+        raise AssertionError(
+            f"Laminar apical-gating test failed: L2/3 spikes off={l23_off}, on={l23_on} (expected on>off)"
+        )
+    report.append(f"Test 17 (Laminar apical): L2/3 spikes off={l23_off}, on={l23_on} (contrast=2.0)")
+
     # Save a small numeric bundle + a human-readable report.
     np.savez_compressed(os.path.join(out_dir, "selftest_metrics.npz"),
                         thetas_deg=thetas.astype(np.float32),
@@ -2164,6 +3654,8 @@ def main() -> None:
     ap.add_argument("--eval-K", type=int, default=12, help="Number of orientations to test")
     ap.add_argument("--eval-repeats", type=int, default=3)
     ap.add_argument("--baseline-repeats", type=int, default=7)
+    ap.add_argument("--weight-smooth-sigma", type=float, default=1.0,
+                    help="sigma for Gaussian smoothing in filter visualizations (0 disables)")
     ap.add_argument("--train-theta-schedule", type=str, default="low_discrepancy",
                     choices=["random", "low_discrepancy"],
                     help="orientation schedule during training (low_discrepancy reduces finite-sample skews)")
@@ -2178,6 +3670,8 @@ def main() -> None:
                     help="sparse_spots: refresh period (ms)")
     ap.add_argument("--spots-amp", type=float, default=None,
                     help="sparse_spots: luminance amplitude for each spot (+/-amp)")
+    ap.add_argument("--spots-sigma", type=float, default=None,
+                    help="sparse_spots: spot size (pixels); <=0 => single-pixel spots, >0 => Gaussian blobs")
     ap.add_argument("--noise-sigma", type=float, default=None,
                     help="white_noise: per-pixel luminance std (Gaussian)")
     ap.add_argument("--noise-clip", type=float, default=None,
@@ -2190,6 +3684,10 @@ def main() -> None:
                     help="grating spatial frequency (cycles per pixel unit)")
     ap.add_argument("--temporal-freq", type=float, default=None,
                     help="grating temporal frequency (Hz)")
+    ap.add_argument("--base-rate", type=float, default=None,
+                    help="RGC baseline Poisson rate (Hz)")
+    ap.add_argument("--gain-rate", type=float, default=None,
+                    help="RGC gain (Hz per unit drive)")
     ap.add_argument("--no-rgc-center-surround", action="store_true",
                     help="disable RGC center–surround DoG filtering (less biological; mostly for debugging)")
     ap.add_argument("--rgc-center-sigma", type=float, default=None,
@@ -2206,6 +3704,34 @@ def main() -> None:
                     help="padding (pixels) for padded_fft DoG; 0/None => auto")
     ap.add_argument("--rgc-pos-jitter", type=float, default=None,
                     help="RGC mosaic position jitter (fraction of pixel spacing; 0 disables)")
+    ap.add_argument("--separate-onoff-mosaics", action="store_true",
+                    help="use distinct ON and OFF RGC mosaics (biological; avoids perfectly co-registered ON/OFF pairs)")
+    ap.add_argument("--onoff-offset", type=float, default=None,
+                    help="ON/OFF mosaic offset magnitude (pixels) when --separate-onoff-mosaics is enabled")
+    ap.add_argument("--onoff-offset-angle-deg", type=float, default=None,
+                    help="ON/OFF mosaic offset angle (deg); if omitted, choose a seeded random angle")
+    ap.add_argument("--rgc-temporal-filter", action="store_true",
+                    help="enable simple biphasic temporal filtering in RGC drive (fast - slow)")
+    ap.add_argument("--rgc-tau-fast", type=float, default=None,
+                    help="RGC temporal filter fast time constant (ms)")
+    ap.add_argument("--rgc-tau-slow", type=float, default=None,
+                    help="RGC temporal filter slow time constant (ms)")
+    ap.add_argument("--rgc-temporal-gain", type=float, default=None,
+                    help="RGC temporal filter gain multiplier")
+    ap.add_argument("--rgc-refractory-ms", type=float, default=None,
+                    help="RGC absolute refractory period (ms); 0 disables")
+    ap.add_argument("--no-lgn-pooling", action="store_true",
+                    help="disable explicit retinogeniculate pooling (fallback to one-to-one RGC->LGN)")
+    ap.add_argument("--lgn-pool-sigma-center", type=float, default=None,
+                    help="RGC->LGN same-sign center pooling sigma (pixels)")
+    ap.add_argument("--lgn-pool-sigma-surround", type=float, default=None,
+                    help="RGC->LGN opposite-sign surround pooling sigma (pixels)")
+    ap.add_argument("--lgn-pool-same-gain", type=float, default=None,
+                    help="gain for same-sign retinogeniculate pooling")
+    ap.add_argument("--lgn-pool-opponent-gain", type=float, default=None,
+                    help="gain for opposite-sign retinogeniculate pooling (antagonistic)")
+    ap.add_argument("--lgn-rgc-tau-ms", type=float, default=None,
+                    help="LGN pre-integration time constant for pooled RGC drive (ms)")
     ap.add_argument("--no-tc-stp", action="store_true",
                     help="disable thalamocortical short-term depression (LGN->V1 E)")
     ap.add_argument("--tc-stp-u", type=float, default=None,
@@ -2224,6 +3750,36 @@ def main() -> None:
                     help="retinotopic weight-cap sigma for PV (pixels; 0 disables)")
     ap.add_argument("--lgn-sigma-pp", type=float, default=None,
                     help="retinotopic weight-cap sigma for push–pull (pixels; 0 disables)")
+    ap.add_argument("--pv-in-sigma", type=float, default=None,
+                    help="E->PV connectivity sigma in cortical-distance units (0 => private PV)")
+    ap.add_argument("--pv-out-sigma", type=float, default=None,
+                    help="PV->E connectivity sigma in cortical-distance units (0 => private PV)")
+    ap.add_argument("--pv-pv-sigma", type=float, default=None,
+                    help="PV->PV coupling sigma in cortical-distance units (0 disables)")
+    ap.add_argument("--w-pv-pv", type=float, default=None,
+                    help="PV->PV inhibitory current increment (0 disables)")
+    ap.add_argument("--n-vip-per-ensemble", type=int, default=None,
+                    help="VIP interneurons per ensemble (0 disables)")
+    ap.add_argument("--w-e-vip", type=float, default=None,
+                    help="E->VIP excitatory current increment")
+    ap.add_argument("--w-vip-som", type=float, default=None,
+                    help="VIP->SOM inhibitory current increment")
+    ap.add_argument("--vip-bias-current", type=float, default=None,
+                    help="VIP tonic bias current (models state/top-down)")
+    ap.add_argument("--tau-apical", type=float, default=None,
+                    help="apical/feedback-like excitatory conductance time constant (ms)")
+    ap.add_argument("--apical-gain", type=float, default=None,
+                    help="apical multiplicative gain (0 disables apical modulation)")
+    ap.add_argument("--apical-threshold", type=float, default=None,
+                    help="apical gating threshold (conductance units)")
+    ap.add_argument("--apical-slope", type=float, default=None,
+                    help="apical gating slope (conductance units)")
+    ap.add_argument("--laminar", action="store_true",
+                    help="enable minimal laminar L4->L2/3 scaffold (apical targets L2/3 when enabled)")
+    ap.add_argument("--w-l4-l23", type=float, default=None,
+                    help="laminar: L4->L2/3 basal current weight (same units as W_e_e)")
+    ap.add_argument("--l4-l23-sigma", type=float, default=None,
+                    help="laminar: spread of L4->L2/3 projections over cortex_dist2 (0 => same-ensemble only)")
     ap.add_argument("--tc-conn-fraction-e", type=float, default=None,
                     help="fraction of LGN afferents present per excitatory neuron (0..1]; <1 enforces sparse anatomical mask)")
     ap.add_argument("--tc-conn-fraction-pv", type=float, default=None,
@@ -2232,8 +3788,26 @@ def main() -> None:
                     help="fraction of LGN afferents present per PP interneuron (0..1]")
     ap.add_argument("--tc-no-balance-onoff", action="store_true",
                     help="when using sparse thalamocortical connectivity, do not enforce balanced ON/OFF sampling")
-    ap.add_argument("--no-pp-onoff-swap", action="store_true",
-                    help="disable ON/OFF swap into PP interneurons (removes built-in phase opposition)")
+    ap.add_argument("--pp-onoff-swap", action=argparse.BooleanOptionalAction, default=None,
+                    help="enable explicit ON/OFF swap into PP interneurons (adds built-in phase opposition)")
+    ap.add_argument("--a-split", type=float, default=None,
+                    help="ON/OFF split-competition strength (0 disables; developmental constraint)")
+    ap.add_argument("--split-constraint-rate", type=float, default=None,
+                    help="ON/OFF split-constraint scaling rate (0 disables; local per-neuron)")
+    ap.add_argument("--split-constraint-clip", type=float, default=None,
+                    help="ON/OFF split-constraint multiplicative clip per application (e.g., 0.02 => [0.98,1.02])")
+    ap.add_argument("--no-split-equalize-onoff", action="store_true",
+                    help="do not equalize ON/OFF resource targets for split constraint (use initial sums)")
+    ap.add_argument("--no-split-constraint", action="store_true",
+                    help="disable ON/OFF split-constraint scaling (equivalent to --split-constraint-rate 0)")
+    ap.add_argument("--split-overlap-adaptive", action="store_true",
+                    help="enable adaptive gain of ON/OFF split competition based on ON/OFF overlap")
+    ap.add_argument("--no-split-overlap-adaptive", action="store_true",
+                    help="disable adaptive gain of ON/OFF split competition based on overlap")
+    ap.add_argument("--split-overlap-min", type=float, default=None,
+                    help="minimum multiplier for overlap-adaptive split competition")
+    ap.add_argument("--split-overlap-max", type=float, default=None,
+                    help="maximum multiplier for overlap-adaptive split competition")
     ap.add_argument("--run-tests", action="store_true",
                     help="run built-in self-tests and exit")
 
@@ -2259,12 +3833,18 @@ def main() -> None:
         p_kwargs["spatial_freq"] = float(args.spatial_freq)
     if args.temporal_freq is not None:
         p_kwargs["temporal_freq"] = float(args.temporal_freq)
+    if args.base_rate is not None:
+        p_kwargs["base_rate"] = float(args.base_rate)
+    if args.gain_rate is not None:
+        p_kwargs["gain_rate"] = float(args.gain_rate)
     if args.spots_density is not None:
         p_kwargs["spots_density"] = float(args.spots_density)
     if args.spots_frame_ms is not None:
         p_kwargs["spots_frame_ms"] = float(args.spots_frame_ms)
     if args.spots_amp is not None:
         p_kwargs["spots_amp"] = float(args.spots_amp)
+    if args.spots_sigma is not None:
+        p_kwargs["spots_sigma"] = float(args.spots_sigma)
     if args.noise_sigma is not None:
         p_kwargs["noise_sigma"] = float(args.noise_sigma)
     if args.noise_clip is not None:
@@ -2285,6 +3865,34 @@ def main() -> None:
         p_kwargs["rgc_dog_pad"] = int(args.rgc_dog_pad)
     if args.rgc_pos_jitter is not None:
         p_kwargs["rgc_pos_jitter"] = float(args.rgc_pos_jitter)
+    if args.separate_onoff_mosaics:
+        p_kwargs["rgc_separate_onoff_mosaics"] = True
+    if args.onoff_offset is not None:
+        p_kwargs["rgc_onoff_offset"] = float(args.onoff_offset)
+    if args.onoff_offset_angle_deg is not None:
+        p_kwargs["rgc_onoff_offset_angle_deg"] = float(args.onoff_offset_angle_deg)
+    if args.rgc_temporal_filter:
+        p_kwargs["rgc_temporal_filter"] = True
+    if args.rgc_tau_fast is not None:
+        p_kwargs["rgc_tau_fast"] = float(args.rgc_tau_fast)
+    if args.rgc_tau_slow is not None:
+        p_kwargs["rgc_tau_slow"] = float(args.rgc_tau_slow)
+    if args.rgc_temporal_gain is not None:
+        p_kwargs["rgc_temporal_gain"] = float(args.rgc_temporal_gain)
+    if args.rgc_refractory_ms is not None:
+        p_kwargs["rgc_refractory_ms"] = float(args.rgc_refractory_ms)
+    if args.no_lgn_pooling:
+        p_kwargs["lgn_pooling"] = False
+    if args.lgn_pool_sigma_center is not None:
+        p_kwargs["lgn_pool_sigma_center"] = float(args.lgn_pool_sigma_center)
+    if args.lgn_pool_sigma_surround is not None:
+        p_kwargs["lgn_pool_sigma_surround"] = float(args.lgn_pool_sigma_surround)
+    if args.lgn_pool_same_gain is not None:
+        p_kwargs["lgn_pool_same_gain"] = float(args.lgn_pool_same_gain)
+    if args.lgn_pool_opponent_gain is not None:
+        p_kwargs["lgn_pool_opponent_gain"] = float(args.lgn_pool_opponent_gain)
+    if args.lgn_rgc_tau_ms is not None:
+        p_kwargs["lgn_rgc_tau_ms"] = float(args.lgn_rgc_tau_ms)
     if args.no_tc_stp:
         p_kwargs["tc_stp_enabled"] = False
     if args.tc_stp_u is not None:
@@ -2303,6 +3911,36 @@ def main() -> None:
         p_kwargs["lgn_sigma_pv"] = float(args.lgn_sigma_pv)
     if args.lgn_sigma_pp is not None:
         p_kwargs["lgn_sigma_pp"] = float(args.lgn_sigma_pp)
+    if args.pv_in_sigma is not None:
+        p_kwargs["pv_in_sigma"] = float(args.pv_in_sigma)
+    if args.pv_out_sigma is not None:
+        p_kwargs["pv_out_sigma"] = float(args.pv_out_sigma)
+    if args.pv_pv_sigma is not None:
+        p_kwargs["pv_pv_sigma"] = float(args.pv_pv_sigma)
+    if args.w_pv_pv is not None:
+        p_kwargs["w_pv_pv"] = float(args.w_pv_pv)
+    if args.n_vip_per_ensemble is not None:
+        p_kwargs["n_vip_per_ensemble"] = int(args.n_vip_per_ensemble)
+    if args.w_e_vip is not None:
+        p_kwargs["w_e_vip"] = float(args.w_e_vip)
+    if args.w_vip_som is not None:
+        p_kwargs["w_vip_som"] = float(args.w_vip_som)
+    if args.vip_bias_current is not None:
+        p_kwargs["vip_bias_current"] = float(args.vip_bias_current)
+    if args.tau_apical is not None:
+        p_kwargs["tau_apical"] = float(args.tau_apical)
+    if args.apical_gain is not None:
+        p_kwargs["apical_gain"] = float(args.apical_gain)
+    if args.apical_threshold is not None:
+        p_kwargs["apical_threshold"] = float(args.apical_threshold)
+    if args.apical_slope is not None:
+        p_kwargs["apical_slope"] = float(args.apical_slope)
+    if args.laminar:
+        p_kwargs["laminar_enabled"] = True
+    if args.w_l4_l23 is not None:
+        p_kwargs["w_l4_l23"] = float(args.w_l4_l23)
+    if args.l4_l23_sigma is not None:
+        p_kwargs["l4_l23_sigma"] = float(args.l4_l23_sigma)
     if args.tc_conn_fraction_e is not None:
         p_kwargs["tc_conn_fraction_e"] = float(args.tc_conn_fraction_e)
     if args.tc_conn_fraction_pv is not None:
@@ -2311,8 +3949,26 @@ def main() -> None:
         p_kwargs["tc_conn_fraction_pp"] = float(args.tc_conn_fraction_pp)
     if args.tc_no_balance_onoff:
         p_kwargs["tc_conn_balance_onoff"] = False
-    if args.no_pp_onoff_swap:
-        p_kwargs["pp_onoff_swap"] = False
+    if args.pp_onoff_swap is not None:
+        p_kwargs["pp_onoff_swap"] = bool(args.pp_onoff_swap)
+    if args.a_split is not None:
+        p_kwargs["A_split"] = float(args.a_split)
+    if args.split_constraint_rate is not None:
+        p_kwargs["split_constraint_rate"] = float(args.split_constraint_rate)
+    if args.split_constraint_clip is not None:
+        p_kwargs["split_constraint_clip"] = float(args.split_constraint_clip)
+    if args.no_split_equalize_onoff:
+        p_kwargs["split_constraint_equalize_onoff"] = False
+    if args.no_split_constraint:
+        p_kwargs["split_constraint_rate"] = 0.0
+    if args.split_overlap_adaptive:
+        p_kwargs["split_overlap_adaptive"] = True
+    if args.no_split_overlap_adaptive:
+        p_kwargs["split_overlap_adaptive"] = False
+    if args.split_overlap_min is not None:
+        p_kwargs["split_overlap_min"] = float(args.split_overlap_min)
+    if args.split_overlap_max is not None:
+        p_kwargs["split_overlap_max"] = float(args.split_overlap_max)
 
     p = Params(**p_kwargs)
     net = RgcLgnV1Network(p, init_mode=args.init_mode)
@@ -2322,6 +3978,21 @@ def main() -> None:
     print(f"[init] Neuron types: LGN=TC(Izhikevich), V1=RS, PV=FS, SOM=LTS")
     print(f"[init] Plasticity: Triplet STDP + iSTDP (PV) + STP (TC) + optional synaptic scaling={'ON' if p.homeostasis_rate>0 else 'OFF'}")
     print(f"[init] Inhibition: PV (LGN-driven + local E-driven) + SOM (lateral)")
+    if (float(p.pv_in_sigma) > 0.0) or (float(p.pv_out_sigma) > 0.0):
+        print(f"[init] PV connectivity: spread (in_sigma={float(p.pv_in_sigma):.2f}, out_sigma={float(p.pv_out_sigma):.2f})")
+    if (float(p.pv_pv_sigma) > 0.0) and (float(p.w_pv_pv) > 0.0):
+        print(f"[init] PV↔PV coupling: ON (sigma={float(p.pv_pv_sigma):.2f}, w_pv_pv={float(p.w_pv_pv):.3f})")
+    if int(p.n_vip_per_ensemble) > 0:
+        print(
+            f"[init] VIP disinhibition: ON (n_vip/ens={int(p.n_vip_per_ensemble)}, "
+            f"w_e_vip={float(p.w_e_vip):.3f}, w_vip_som={float(p.w_vip_som):.3f}, "
+            f"vip_bias={float(p.vip_bias_current):.3f})"
+        )
+    if float(p.apical_gain) > 0.0:
+        print(
+            f"[init] Apical modulation: ON (tau_apical={float(p.tau_apical):.1f} ms, "
+            f"gain={float(p.apical_gain):.3f}, thr={float(p.apical_threshold):.3f}, slope={float(p.apical_slope):.3f})"
+        )
     if p.rgc_center_surround:
         if str(p.rgc_dog_impl).lower() == "padded_fft":
             print(f"[init] RGC DoG: padded_fft (pad={net._rgc_pad}, norm={p.rgc_dog_norm}, jitter={p.rgc_pos_jitter:.3f})")
@@ -2329,6 +4000,27 @@ def main() -> None:
             print(f"[init] RGC DoG: matrix (norm={p.rgc_dog_norm}, jitter={p.rgc_pos_jitter:.3f})")
     else:
         print(f"[init] RGC DoG: OFF (raw grating -> ON/OFF Poisson)")
+    if p.rgc_separate_onoff_mosaics:
+        ang = net.rgc_onoff_offset_angle_deg
+        ang_s = "seeded-random" if ang is None else f"{float(ang):.1f}°"
+        print(f"[init] RGC mosaics: separate ON/OFF (offset={float(p.rgc_onoff_offset):.2f} px, angle={ang_s})")
+    else:
+        print("[init] RGC mosaics: co-registered ON/OFF")
+    if p.rgc_temporal_filter or float(p.rgc_refractory_ms) > 0.0:
+        print(
+            f"[init] RGC temporal: filter={'ON' if p.rgc_temporal_filter else 'OFF'} "
+            f"(tau_fast={float(p.rgc_tau_fast):.1f} ms, tau_slow={float(p.rgc_tau_slow):.1f} ms, gain={float(p.rgc_temporal_gain):.2f}) "
+            f"| refractory={float(p.rgc_refractory_ms):.1f} ms"
+        )
+    if p.lgn_pooling:
+        print(
+            f"[init] Retinogeniculate pooling: ON "
+            f"(center sigma={float(p.lgn_pool_sigma_center):.2f}, surround sigma={float(p.lgn_pool_sigma_surround):.2f}, "
+            f"same_gain={float(p.lgn_pool_same_gain):.2f}, opp_gain={float(p.lgn_pool_opponent_gain):.2f}, "
+            f"tau={float(p.lgn_rgc_tau_ms):.1f} ms)"
+        )
+    else:
+        print("[init] Retinogeniculate pooling: OFF (one-to-one RGC->LGN)")
     print(f"[init] Train stimulus: {p.train_stimulus} (contrast={p.train_contrast:.3f})")
     if p.train_stimulus == "grating":
         print(f"[init] Training θ schedule: {args.train_theta_schedule}")
@@ -2348,12 +4040,39 @@ def main() -> None:
 
     thetas = np.linspace(0, 180 - 180 / args.eval_K, args.eval_K)
 
+    proj_kwargs: dict = {}
+    if bool(getattr(p, "rgc_separate_onoff_mosaics", False)):
+        proj_kwargs = dict(
+            X_on=net.X_on,
+            Y_on=net.Y_on,
+            X_off=net.X_off,
+            Y_off=net.Y_off,
+            sigma=float(getattr(p, "rgc_center_sigma", 0.5)),
+        )
+
     # --- Baseline evaluation ---
     print("\n[baseline] Evaluating tuning at initialization...")
     rates0 = net.evaluate_tuning(thetas, repeats=args.baseline_repeats)
     osi0, pref0 = compute_osi(rates0, thetas)
+    rf_ori0, rf_pref0 = rf_fft_orientation_metrics(net.W, p.N, on_to_off=net.on_to_off, **proj_kwargs)
+    rf_amp0 = rf_grating_match_tuning(
+        net.W,
+        p.N,
+        float(p.spatial_freq),
+        thetas,
+        on_to_off=net.on_to_off,
+        **proj_kwargs,
+    )
+    rf_osi0, _ = compute_osi(rf_amp0, thetas)
+    w_corr0 = onoff_weight_corr(net.W, p.N, on_to_off=net.on_to_off, **proj_kwargs)
 
     print(f"[seg {0:4d}] mean rate={rates0.mean():.3f} Hz | mean OSI={osi0.mean():.3f} | max OSI={osi0.max():.3f}")
+    print(
+        f"          RF(weight): orientedness mean={float(rf_ori0.mean()):.3f} "
+        f"| grating-match OSI mean={float(rf_osi0.mean()):.3f} "
+        f"(frac>0.45={float((rf_ori0>0.45).mean()):.2f}) | "
+        f"ON/OFF weight corr mean={float(w_corr0.mean()):+.3f}"
+    )
     print(f"          prefs(deg) = {np.round(pref0, 1)}")
     print("          NOTE: Nonzero OSI at init is expected from random RF structure")
     tuned0 = (osi0 >= 0.3)
@@ -2364,8 +4083,12 @@ def main() -> None:
         gap0 = max_circ_gap_180(pref0[tuned0])
         print(f"          pref diversity: resultant={r0:.3f}, max_gap={gap0:.1f}° (mean={mu0:.1f}°)")
 
+    W_init = net.W.copy()
     plot_weight_maps(net.W, p.N, os.path.join(args.out, "weights_seg0000.png"),
                      title="LGN->V1 weights at init (segment 0)")
+    plot_weight_maps(net.W, p.N, os.path.join(args.out, "weights_seg0000_smoothed.png"),
+                     title=f"LGN->V1 weights at init (segment 0, Gaussian sigma={float(args.weight_smooth_sigma):.2f})",
+                     smooth_sigma=float(args.weight_smooth_sigma))
     plot_tuning(rates0, thetas, osi0, pref0,
                 os.path.join(args.out, "tuning_seg0000.png"),
                 title="Baseline tuning (segment 0, before learning)")
@@ -2413,8 +4136,25 @@ def main() -> None:
         if (s % args.viz_every) == 0 or s == p.train_segments:
             rates = net.evaluate_tuning(thetas, repeats=args.eval_repeats)
             osi, pref = compute_osi(rates, thetas)
+            rf_ori, rf_pref = rf_fft_orientation_metrics(net.W, p.N, on_to_off=net.on_to_off, **proj_kwargs)
+            rf_amp = rf_grating_match_tuning(
+                net.W,
+                p.N,
+                float(p.spatial_freq),
+                thetas,
+                on_to_off=net.on_to_off,
+                **proj_kwargs,
+            )
+            rf_osi, _ = compute_osi(rf_amp, thetas)
+            w_corr = onoff_weight_corr(net.W, p.N, on_to_off=net.on_to_off, **proj_kwargs)
 
             print(f"[seg {s:4d}] mean rate={rates.mean():.3f} Hz | mean OSI={osi.mean():.3f} | max OSI={osi.max():.3f}")
+            print(
+                f"          RF(weight): orientedness mean={float(rf_ori.mean()):.3f} "
+                f"| grating-match OSI mean={float(rf_osi.mean()):.3f} "
+                f"(frac>0.45={float((rf_ori>0.45).mean()):.2f}) | "
+                f"ON/OFF weight corr mean={float(w_corr.mean()):+.3f}"
+            )
             print(f"          prefs(deg) = {np.round(pref, 1)}")
             tuned = (osi >= 0.3)
             near90 = (circ_diff_180(pref, 90.0) <= 10.0) & tuned
@@ -2445,9 +4185,26 @@ def main() -> None:
     final_repeats = max(args.baseline_repeats, args.eval_repeats, 7)
     rates1 = net.evaluate_tuning(thetas, repeats=final_repeats)
     osi1, pref1 = compute_osi(rates1, thetas)
+    rf_ori1, rf_pref1 = rf_fft_orientation_metrics(net.W, p.N, on_to_off=net.on_to_off, **proj_kwargs)
+    rf_amp1 = rf_grating_match_tuning(
+        net.W,
+        p.N,
+        float(p.spatial_freq),
+        thetas,
+        on_to_off=net.on_to_off,
+        **proj_kwargs,
+    )
+    rf_osi1, _ = compute_osi(rf_amp1, thetas)
+    w_corr1 = onoff_weight_corr(net.W, p.N, on_to_off=net.on_to_off, **proj_kwargs)
 
     d_osi = osi1 - osi0
     print(f"[final] baseline mean OSI={osi0.mean():.3f} -> final mean OSI={osi1.mean():.3f} (delta={d_osi.mean():+.3f})")
+    print(
+        f"[final] RF(weight): orientedness mean={float(rf_ori1.mean()):.3f} "
+        f"| grating-match OSI mean={float(rf_osi1.mean()):.3f} "
+        f"(frac>0.45={float((rf_ori1>0.45).mean()):.2f}) | "
+        f"ON/OFF weight corr mean={float(w_corr1.mean()):+.3f}"
+    )
     print(f"[final] fraction ensembles with OSI>0.3: {(osi1>0.3).mean()*100:.1f}%")
     print(f"[final] fraction ensembles with OSI>0.5: {(osi1>0.5).mean()*100:.1f}%")
     tuned1 = (osi1 >= 0.3)
@@ -2460,6 +4217,16 @@ def main() -> None:
     plot_weight_maps(net.W, p.N,
                     os.path.join(args.out, "weights_final.png"),
                     title="LGN->V1 weights (final)")
+    plot_weight_maps(net.W, p.N,
+                    os.path.join(args.out, "weights_final_smoothed.png"),
+                    title=f"LGN->V1 weights (final, Gaussian sigma={float(args.weight_smooth_sigma):.2f})",
+                    smooth_sigma=float(args.weight_smooth_sigma))
+    plot_weight_maps_before_after(
+        W_init, net.W, p.N,
+        os.path.join(args.out, "weights_before_vs_after_smoothed.png"),
+        title=f"LGN->V1 filters before vs after training (Gaussian sigma={float(args.weight_smooth_sigma):.2f})",
+        smooth_sigma=float(args.weight_smooth_sigma),
+    )
     plot_tuning(rates1, thetas, osi1, pref1,
                os.path.join(args.out, "tuning_final.png"),
                title="Final tuning (after learning)")
